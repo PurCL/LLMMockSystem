@@ -1,32 +1,105 @@
-# install_hook.py
-import os
-import shutil
-import glob
+# src/auto_install_hook.py
 import sys
+import os
+import traceback
+import subprocess
+import shutil
 
-sp_dirs = glob.glob(".venv/lib/python*/site-packages")
-if not sp_dirs:
-    print("❌ Error: 找不到 .venv 文件夹。请确保你在项目根目录。")
-    sys.exit(1)
+_original_excepthook = sys.excepthook
 
-site_packages = sp_dirs[0]
+def install_and_restart(packages):
+    """Install packages in the current venv and restart the entire process, supporting uv for fast installation"""
+    if not packages:
+        return False
+        
+    print(f"\n[📦 Auto-Heal] Missing dependencies detected, preparing to install: {', '.join(packages)}")
+    try:
+        if shutil.which("uv"):
+            print("[⚙️ Engine Check] uv fast package manager found, enabling full-speed installation mode...")
+            cmd = ["uv", "pip", "install"] + packages
+        else:
+            cmd = [sys.executable, "-m", "pip", "install"] + packages
 
-# 🚨 修改点 1：将拷贝目标更新为新的自动安装 Hook
-for file in ["src/auto_install_hook.py", "src/llm_client.py"]:
-    if not os.path.exists(file):
-        print(f"❌ Error: 找不到 {file}。")
-        sys.exit(1)
-    shutil.copy(file, site_packages)
+        subprocess.check_call(cmd)
+        print(f"[✅ Auto-Heal] {packages} installed successfully! Hot-restarting process...\n" + "="*50)
+        
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except subprocess.CalledProcessError as e:
+        print(f"[❌ Auto-Heal] Dependency installation failed: {e}")
+        return False
+    except Exception as e:
+        print(f"[❌ Auto-Heal] Process restart failed: {e}")
+        return False
 
-# 🚨 修改点 2：更新 .pth 文件名和内部触发语句
-pth_path = os.path.join(site_packages, "000_auto_install.pth")
-with open(pth_path, "w") as f:
-    f.write("import auto_install_hook\n")
+def is_dependency_error(exc_type, exc_value):
+    """Intelligently determine if it's a missing dependency error (including exceptions wrapped by third-party libraries)"""
+    if issubclass(exc_type, ImportError): return True
+    
+    # Check exception chain (The above exception was the direct cause...)
+    if getattr(exc_value, "__cause__", None) and isinstance(exc_value.__cause__, ImportError): return True
+    if getattr(exc_value, "__context__", None) and isinstance(exc_value.__context__, ImportError): return True
+    
+    # Check error text characteristics (fallback mechanism)
+    msg = str(exc_value).lower()
+    if "pip install" in msg or "not installed" in msg or "no module named" in msg: return True
+    
+    return False
 
-# 🚨 修改点 3：更新提示文案，反映新的“自愈”机制
-print(f"✅ 成功将依赖自愈 Hook 植入到: {site_packages}")
-print("====================================================")
-print("🎉 安装完成！现在你可以直接激活虚拟环境并运行你的项目了：")
-print("source .venv/bin/activate")
-print("python -m uvicorn app.main:app")
-print("====================================================")
+def _dependency_excepthook(exc_type, exc_value, exc_traceback):
+    _original_excepthook(exc_type, exc_value, exc_traceback)
+    
+    if issubclass(exc_type, (SystemExit, KeyboardInterrupt)): 
+        return
+        
+    if is_dependency_error(exc_type, exc_value):
+        # Pass the complete traceback to the LLM, ensuring it can see key prompts like 'pip install pwdlib[argon2]'
+        tb_str = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+        print(f"\n[🤖 LLM Interception] Suspected missing dependency error caught! Handing over to Claude for intelligent analysis...")
+        
+        try:
+            import llm_client
+            packages = llm_client.analyze_missing_deps(tb_str)
+            if packages:
+                install_and_restart(packages)
+            else:
+                print("❌ [Fix Failed] Agent could not identify the packages to install.")
+        except Exception as e: 
+            print(f"⚠️ [System Error]: {e}")
+
+sys.excepthook = _dependency_excepthook
+
+# =====================================================================
+# HTTP 500 Route-Level Interception
+# =====================================================================
+try:
+    from starlette.routing import Route
+    _original_route_handle = Route.handle
+
+    async def _mock_route_handle(self, scope, receive, send):
+        try:
+            await _original_route_handle(self, scope, receive, send)
+        except Exception as e:
+            tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+            print("\n" + "🔥"*25)
+            print("🚨 [HTTP 500 Crash Stack Trace]")
+            print(tb_str.strip())
+            print("🔥"*25 + "\n")
+            
+            if is_dependency_error(type(e), e):
+                print(f"[🤖 LLM Interception] Missing dependency triggered within route, handing over to Claude for analysis...")
+                try:
+                    import llm_client
+                    packages = llm_client.analyze_missing_deps(tb_str)
+                    if packages:
+                        install_and_restart(packages)
+                    else:
+                        print("❌ [Fix Failed] Agent could not identify the packages to install.")
+                except Exception as ex: 
+                    print(f"⚠️ [System Error]: {ex}")
+            
+            os._exit(1)
+
+    Route.handle = _mock_route_handle
+    print("[LLM Auto-Fix] Route-level dependency auto-healing interceptor is ready.", file=sys.stderr)
+except ImportError:
+    pass

@@ -5,9 +5,105 @@ import json
 import types
 import traceback
 from importlib.machinery import ModuleSpec
+import subprocess
+import socket
+import time
+import atexit
+import importlib.metadata
+
+# =====================================================================
+# 🐳 Dynamic Infrastructure: Auto-detect free ports and spin up a real PostgreSQL container
+# =====================================================================
+def _get_free_port():
+    """Detect and return an available free port on the local machine"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        return s.getsockname()[1]
+
+def _wait_for_db_ready(container_name, timeout=20):
+    """Poll pg_isready via docker exec to ensure the database is truly ready to accept connections"""
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        res = subprocess.run(
+            ["docker", "exec", container_name, "pg_isready", "-U", "postgres"],
+            capture_output=True
+        )
+        if res.returncode == 0:
+            return True
+        time.sleep(0.5)
+    return False
+
+def _cleanup_container(container_name):
+    """Cleanup hook upon process exit to destroy the temporary container"""
+    print(f"\n[⚙️ Ghost Engine] Process exiting, destroying temporary database container {container_name}...")
+    subprocess.run(["docker", "stop", container_name], capture_output=True, check=False)
+
+def _setup_dynamic_mock_db():
+    # Prevent Uvicorn's worker processes from repeatedly spinning up containers
+    if os.environ.get("_DYNAMIC_DB_STARTED"):
+        return
+
+    # 1. Strict Docker availability test
+    try:
+        # Using 'docker ps' not only checks if the command exists but also if the Daemon is running
+        res = subprocess.run(["docker", "ps"], check=True, capture_output=True, text=True)
+    except FileNotFoundError:
+        print("[⚙️ Ghost Engine] ⚠️ 'docker' command not found! PATH environment variable might not include ~/.local/bin")
+        return
+    except subprocess.CalledProcessError as e:
+        print(f"[⚙️ Ghost Engine] ⚠️ Docker command found, but unable to connect to Daemon!\nError message: {e.stderr.strip()}")
+        print("[⚙️ Ghost Engine] 💡 Tip: If using Rootless Docker, ensure you have run: systemctl --user start docker")
+        print("[⚙️ Ghost Engine] 💡 Tip: And ensure DOCKER_HOST is set (e.g., export DOCKER_HOST=unix:///run/user/1000/docker.sock)")
+        return
+    except Exception as e:
+        print(f"[⚙️ Ghost Engine] ⚠️ Unknown error occurred during Docker detection: {e}")
+        return
+
+    # 2. Database spin-up logic (If you reach here, your Rootless Docker is fully operational)
+    port = _get_free_port()
+    container_name = f"llm-mock-postgres-{port}"
+    
+    print(f"[⚙️ Ghost Engine] 🎯 Free port {port} locked, spinning up PostgreSQL container using Docker...")
+    
+    cmd = [
+        "docker", "run", "-d", "--rm",
+        "--name", container_name,
+        "-e", "POSTGRES_USER=postgres",
+        "-e", "POSTGRES_PASSWORD=changethis",
+        "-e", "POSTGRES_DB=app",
+        "-p", f"{port}:5432",
+        "postgres:14"
+    ]
+    
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+        atexit.register(_cleanup_container, container_name)
+    except subprocess.CalledProcessError as e:
+        print(f"[⚙️ Ghost Engine] ⚠️ Container startup failed: {e.stderr.decode('utf-8')}")
+        return
+
+    print("[⚙️ Ghost Engine] ⏳ Waiting for PostgreSQL engine to initialize...")
+    if _wait_for_db_ready(container_name):
+        print(f"[⚙️ Ghost Engine] ✅ Database ready! Dynamically binding environment variables (Port: {port})...")
+        os.environ["POSTGRES_SERVER"] = "localhost"
+        os.environ["POSTGRES_PORT"] = str(port)
+        os.environ["POSTGRES_USER"] = "postgres"
+        os.environ["POSTGRES_PASSWORD"] = "changethis"
+        os.environ["POSTGRES_DB"] = "app"
+        
+        db_url = f"postgresql+psycopg2://postgres:changethis@localhost:{port}/app"
+        os.environ["SQLALCHEMY_DATABASE_URI"] = db_url
+        os.environ["DATABASE_URL"] = db_url
+        os.environ["_DYNAMIC_DB_STARTED"] = "1"
+    else:
+        print("[⚙️ Ghost Engine] ❌ Database startup timeout!")
+        return
+
+# Execute spin-up logic immediately
+_setup_dynamic_mock_db()
 
 STATE_FILE = ".mock_state.json"
-mock_state = {"env": {}, "api_responses": {}}
+mock_state = {"env": {}, "mocked_imports": {}, "core_imports": {}}
 
 if os.path.exists(STATE_FILE):
     try:
@@ -16,40 +112,79 @@ if os.path.exists(STATE_FILE):
     except Exception:
         pass
 
+# =====================================================================
+# 📦 Real Dependency Scanner: Record all core libraries installed in the current venv and their versions
+# =====================================================================
+def _record_core_imports():
+    """Scan the real installed packages in the virtual environment and record them in core_imports"""
+    try:
+        # Get all installed packages and their versions in the current environment
+        installed_packages = {
+            dist.metadata["Name"]: dist.version 
+            for dist in importlib.metadata.distributions()
+        }
+        
+        # To prevent useless disk writes on every startup, only write when the dependency list changes
+        if mock_state.get("core_imports") != installed_packages:
+            mock_state["core_imports"] = installed_packages
+            with open(STATE_FILE, "w") as f:
+                json.dump(mock_state, f, indent=4)
+    except Exception as e:
+        print(f"[⚙️ Ghost Engine] ⚠️ Failed to record core dependencies: {e}")
+
+# Execute scan immediately
+_record_core_imports()
+
 for key, value in mock_state.get("env", {}).items():
     if key not in os.environ:
         os.environ[key] = str(value)
 
 # =====================================================================
-# 🛡️ 底层框架白名单 (绝对不能自动 Mock 的可选依赖)
+# 📦 Dependency Recorder: Organize API Responses under Package dimensions
+# =====================================================================
+def _record_mocked_import(fullname):
+    """Record the mocked package and initialize its api_responses container"""
+    base_name = fullname.split('.')[0] # Extract top-level package name
+    
+    if base_name not in mock_state["mocked_imports"]:
+        mock_state["mocked_imports"][base_name] = {"api_responses": {}}
+        try:
+            with open(STATE_FILE, "w") as f:
+                json.dump(mock_state, f, indent=4)
+        except Exception:
+            pass
+
+
+# =====================================================================
+# 🛡️ Underlying Framework Whitelist (Optional dependencies that absolutely MUST NOT be auto-mocked)
 # =====================================================================
 IGNORED_MODULES = {
-    # 测试与系统底层
+    # Testing and system fundamentals
     'pytest', '_pytest', 'pluggy', 'mock', 'unittest',
     
-    # 网络与异步底层框架
+    # Network and async underlying frameworks
     'brotli', 'brotlicffi', 'backports', 'h2', 'socksio', 'trio',
     'ujson', 'orjson', 'uvloop', 'httptools', 'websockets', 'watchfiles',
-    'colorama', 'dotenv', 'yaml', 'jinja2', 'cryptography',
+    'colorama', 'dotenv', 'yaml', 'jinja2', 'cryptography', 'sniffio'
     
-    # 🚨 Claude SDK / jsonschema / OpenAPI 等底层库的格式校验全家桶
+    # 🚨 Format validation suites for Claude SDK / jsonschema / OpenAPI, etc.
     'zstandard', 'fqdn', 'rfc3987', 'rfc3339_validator', 'webcolors',
     'jsonpointer', 'uri_template', 'isoduration', 'jsonschema',
-    'rfc3986_validator', 'rfc3987_syntax', 'strict_rfc3339', 'aniso8601'
+    'rfc3986_validator', 'rfc3987_syntax', 'strict_rfc3339', 'aniso8601', 'rich', 'anyio'
 }
 
 # =====================================================================
-# 📸 1. 逻辑签名记录仪
+# 📸 1. Logical Signature Recorder
 # =====================================================================
 _recent_mock_calls = []
 
 def _get_logical_signature(name, args=None, kwargs=None):
-    """生成逻辑签名：例如 'psycopg.paramstyle' 或 'cursor.execute("SELECT...")'"""
+    """Generate logical signature: e.g., 'psycopg.paramstyle' or 'cursor.execute("SELECT...")'"""
     if args is None and kwargs is None:
-        return name # 属性访问路径
+        return name # Attribute access path
     
-    # 方法调用：包含参数序列化
-    # 限制长度防止 Key 过大，同时保证基本的参数区分度
+    # Method call: Includes parameter serialization
+    # Limit length to prevent overly large Keys while maintaining basic parameter distinction
     arg_reprs = [repr(a)[:50] for a in (args or [])]
     kwarg_reprs = [f"{k}={repr(v)[:50]}" for k, v in (kwargs or {}).items()]
     signature = f"{name}({', '.join(arg_reprs + kwarg_reprs)})"
@@ -59,25 +194,29 @@ def _track_and_get_mock(sig_key):
     _recent_mock_calls.append(sig_key)
     if len(_recent_mock_calls) > 100: 
         _recent_mock_calls.pop(0)
+
+    # Extract top-level package name from the first segment of the logical signature (e.g., 'psycopg.cursor...' -> 'psycopg')
+    root_pkg = sig_key.split('.')[0].split('(')[0]
     
-    res = mock_state.get("api_responses", {})
+    # Accurately look for responses under the package's dedicated namespace
+    res = mock_state.get("mocked_imports", {}).get(root_pkg, {}).get("api_responses", {})
     
-    # 1. 完整逻辑签名匹配 (连同参数一起精确命中)
+    # 1. Full logical signature match (exact match including parameters)
     if sig_key in res: 
         return res[sig_key]
         
-    # 2. 降级匹配: 提取基础 API 路径
+    # 2. Downgrade match: Extract base API path
     base_name = sig_key.split('(')[0]
     
-    # 尝试匹配无括号版 (针对属性)
+    # Try matching unparenthesized version (for attributes)
     if base_name in res: 
         return res[base_name]
         
-    # 尝试匹配带空括号版 (完美接住 Claude 刚才生成的泛型补丁)
+    # Try matching empty parenthesis version (perfectly catching generic patches generated by Claude)
     if f"{base_name}()" in res: 
         return res[f"{base_name}()"]
         
-    # 3. 终极降级: 连前面的模块名都不管了，只看最后的方法名
+    # 3. Ultimate downgrade: Ignore preceding module names entirely, just look at the final method name
     api_name = base_name.split('.')[-1]
     if api_name in res:
         return res[api_name]
@@ -87,11 +226,11 @@ def _track_and_get_mock(sig_key):
     return None
 
 # =====================================================================
-# 👻 2. 静态幽灵引擎 (逻辑驱动版)
+# 👻 2. Static Ghost Engine (Logic-Driven Version)
 # =====================================================================
 class LLMMockProxy(str):
     def __new__(cls, name):
-        return super().__new__(cls, "") # 默认依然是空字符串
+        return super().__new__(cls, "") # Default is still an empty string
 
     def __init__(self, name):
         self._name = name
@@ -102,7 +241,7 @@ class LLMMockProxy(str):
             raise AttributeError(item)
             
         full_path = f"{self._name}.{item}"
-        sig_key = _get_logical_signature(full_path) # 记录变量名路径
+        sig_key = _get_logical_signature(full_path) # Record variable name path
         
         mock_val = _track_and_get_mock(sig_key)
         if mock_val is not None:
@@ -119,7 +258,7 @@ class LLMMockProxy(str):
         return LLMMockProxy(full_path)
         
     def __call__(self, *args, **kwargs):
-        sig_key = _get_logical_signature(self._name, args, kwargs) # 记录 API+参数
+        sig_key = _get_logical_signature(self._name, args, kwargs) # Record API + parameters
         mock_val = _track_and_get_mock(sig_key)
         if mock_val is not None:
             return mock_val
@@ -135,7 +274,7 @@ class LLMMockProxy(str):
 class GhostModule(types.ModuleType):
     def __getattr__(self, name):
         full_path = f"{self.__name__}.{name}"
-        sig_key = _get_logical_signature(full_path) # 🚀 统一使用逻辑签名
+        sig_key = _get_logical_signature(full_path) # 🚀 Uniformly use logical signature
         
         mock_val = _track_and_get_mock(sig_key)
         if mock_val is not None:
@@ -167,36 +306,57 @@ class GhostFinder:
             
         base_name = fullname.split('.')[0]
         
-        # 🚨 核心修复：绝对不能 Mock Python 官方标准库！
-        # 这样 msvcrt 就会被正常放行并报 ImportError，Python 就会乖乖走 Linux 分支了
+        # 🚨 Core Fix: Absolutely DO NOT mock Python official standard libraries!
+        # This allows msvcrt to pass through normally, trigger ImportError, and force Python to obediently take the Linux branch
         if hasattr(sys, 'stdlib_module_names') and base_name in sys.stdlib_module_names:
             return None
             
-        # 排除那些绝不能自动 Mock 的底层 Web/异步框架
+        # Exclude underlying Web/Async frameworks that must never be auto-mocked
         if base_name in IGNORED_MODULES:
             return None
             
-        print(f"[⚙️ 幽灵引擎] 自动假装成功导入未安装包: '{fullname}'")
+        print(f"[⚙️ Ghost Engine] Auto-pretending successful import of uninstalled package: '{fullname}'")
+
+        # 🚨 New: Record intercepted packages and carve out their dedicated namespace in the state file
+        _record_mocked_import(fullname)
+
         return ModuleSpec(fullname, GhostLoader(fullname))
 
-# 挂载到最后，只有真实环境找不到的包才会落入黑洞
+# Mount at the very end; only packages not found in the real environment will fall into this black hole
 sys.meta_path.append(GhostFinder())
 
 # =====================================================================
-# 🚑 3. 自愈机制与状态更新
+# 🚑 3. Auto-Healing Mechanism & State Update
 # =====================================================================
 def _update_state_and_save(patch):
-    print(f"✨ [修复成功] 发现缺失项并已生成补丁: {patch}")
-    new_state = {
-        "env": mock_state.get("env", {}),
-        "api_responses": mock_state.get("api_responses", {})
-    }
-    new_state["env"].update(patch.get("env", {}))
-    new_state["api_responses"].update(patch.get("api_responses", {}))
+    """Receive patch from LLM and automatically distribute it to the corresponding Package's territory"""
+    print(f"✨ [Fix Successful] Missing items detected and patch generated: {patch}")
     
+    if "env" in patch:
+        mock_state.setdefault("env", {}).update(patch["env"])
+        
+    if "api_responses" in patch:
+        for sig_key, value in patch["api_responses"].items():
+            # Intelligent routing: Infer which top-level package this API belongs to
+            root_pkg = sig_key.split('.')[0].split('(')[0]
+            
+            # Forcefully ensure the package's directory tree exists
+            pkg_entry = mock_state.setdefault("mocked_imports", {}).setdefault(root_pkg, {})
+            api_dict = pkg_entry.setdefault("api_responses", {})
+            
+            # Archive write
+            api_dict[sig_key] = value
+
+    # Directly compatible if LLM smartly outputted a new hierarchical structure
+    if "mocked_imports" in patch:
+        for pkg_name, pkg_data in patch["mocked_imports"].items():
+            pkg_entry = mock_state.setdefault("mocked_imports", {}).setdefault(pkg_name, {})
+            if "api_responses" in pkg_data:
+                pkg_entry.setdefault("api_responses", {}).update(pkg_data["api_responses"])
+                
     with open(STATE_FILE, "w") as f:
-        json.dump(new_state, f, indent=4)
-    print(f"✅ 补丁已写入 {STATE_FILE}。")
+        json.dump(mock_state, f, indent=4)
+    print(f"✅ Patch smartly routed and written to {STATE_FILE}.")
 
 _original_excepthook = sys.excepthook
 
@@ -205,15 +365,15 @@ def _mock_excepthook(exc_type, exc_value, exc_traceback):
     if issubclass(exc_type, (SystemExit, KeyboardInterrupt)): return
     tb_str = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback)[-30:])
 
-    print(f"\n[🤖 LLM Mock] 进程崩溃！移交 Claude (附带最近 API 拦截录像)...")
+    print(f"\n[🤖 LLM Mock] Process crashed! Handing over to Claude (with recent API interception recordings)...")
     try:
         import llm_client
         patch = llm_client.analyze_crash(tb_str, _recent_mock_calls)
         if patch.get("env") or patch.get("api_responses"):
             _update_state_and_save(patch)
         else:
-            print("❌ [修复失败] Agent 未能识别修复方案。")
-    except Exception as e: print(f"⚠️ [系统错误]: {e}")
+            print("❌ [Fix Failed] Agent failed to identify a remediation plan.")
+    except Exception as e: print(f"⚠️ [System Error]: {e}")
 
 sys.excepthook = _mock_excepthook
 
@@ -228,28 +388,28 @@ try:
             import traceback
             tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__)[-30:])
             
-            # 🚨 新增：在移交大模型之前，先把 500 错误栈原原本本地展示给你看！
+            # 🚨 New: Show the raw 500 error stack trace before handing over to the LLM!
             print("\n" + "🔥"*25)
-            print("🚨 [HTTP 500 崩溃栈现场直击]")
+            print("🚨 [HTTP 500 Crash Stack Trace Live View]")
             print(tb_str.strip())
             print("🔥"*25 + "\n")
             
-            print(f"[🤖 LLM Mock] 正在将上述崩溃信息与 API 录像移交 Claude...")
+            print(f"[🤖 LLM Mock] Forwarding the above crash info and API recordings to Claude...")
             try:
                 import llm_client
                 patch = llm_client.analyze_crash(tb_str, _recent_mock_calls)
                 if patch.get("env") or patch.get("api_responses"):
                     _update_state_and_save(patch)
-                    print("🛑 [LLM Mock] 补丁已生成！正在强行终止服务器，请直接按 [上箭头 + Enter] 重启！")  
+                    print("🛑 [LLM Mock] Patch generated! Forcefully terminating server. Please press [Up Arrow + Enter] to restart!")  
                 else:
-                    print("❌ [修复失败] Agent 未能识别修复方案。")
+                    print("❌ [Fix Failed] Agent failed to identify a remediation plan.")
             except Exception as ex: 
-                print(f"⚠️ [系统错误]: {ex}")
+                print(f"⚠️ [System Error]: {ex}")
             
             import os
             os._exit(1)
 
     Route.handle = _mock_route_handle
-    print("[LLM Mock] 接口级别 500 错误自愈拦截器已就绪。")
+    print("[LLM Mock] Route-level 500 error auto-healing interceptor is ready.")
 except ImportError:
     pass
