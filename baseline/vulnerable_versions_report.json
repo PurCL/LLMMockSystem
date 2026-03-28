@@ -1,0 +1,499 @@
+{
+  "baseline_vulnerable": true,
+  "total_tests": 54,
+  "vulnerable_combinations": [
+    {
+      "test_id": 1,
+      "mutations": {
+        "PyJWT": "1.7.0"
+      },
+      "status": "vulnerable",
+      "timestamp": "2026-03-19 14:36:02"
+    },
+    {
+      "test_id": 17,
+      "mutations": {
+        "fastapi": "0.130.0"
+      },
+      "status": "vulnerable",
+      "timestamp": "2026-03-19 14:48:08"
+    },
+    {
+      "test_id": 26,
+      "mutations": {
+        "starlette": "0.50.0"
+      },
+      "status": "vulnerable",
+      "timestamp": "2026-03-19 14:53:24"
+    },
+    {
+      "test_id": 27,
+      "mutations": {
+        "starlette": "0.52.1",
+        "fastapi": "0.135.1"
+      },
+      "status": "vulnerable",
+      "timestamp": "2026-03-19 14:54:17"
+    },
+    {
+      "test_id": 36,
+      "mutations": {
+        "starlette": "0.52.1",
+        "PyJWT": "1.7.1"
+      },
+      "status": "vulnerable",
+      "timestamp": "2026-03-19 14:59:26"
+    },
+    {
+      "test_id": 37,
+      "mutations": {
+        "starlette": "0.52.1",
+        "PyJWT": "1.7.0"
+      },
+      "status": "vulnerable",
+      "timestamp": "2026-03-19 15:00:22"
+    },
+    {
+      "test_id": 45,
+      "mutations": {
+        "fastapi": "0.135.1",
+        "PyJWT": "1.7.1"
+      },
+      "status": "vulnerable",
+      "timestamp": "2026-03-19 15:04:59"
+    },
+    {
+      "test_id": 46,
+      "mutations": {
+        "fastapi": "0.135.1",
+        "PyJWT": "1.7.0"
+      },
+      "status": "vulnerable",
+      "timestamp": "2026-03-19 15:05:56"
+    }
+  ],
+  "safe_combinations": [
+    {
+      "test_id": 2,
+      "mutations": {
+        "PyJWT": "2.0.0"
+      },
+      "status": "safe",
+      "timestamp": "2026-03-19 14:36:54"
+    },
+    {
+      "test_id": 3,
+      "mutations": {
+        "PyJWT": "2.0.1"
+      },
+      "status": "safe",
+      "timestamp": "2026-03-19 14:37:50"
+    },
+    {
+      "test_id": 4,
+      "mutations": {
+        "PyJWT": "2.1.0"
+      },
+      "status": "safe",
+      "timestamp": "2026-03-19 14:38:47"
+    },
+    {
+      "test_id": 5,
+      "mutations": {
+        "PyJWT": "2.2.0"
+      },
+      "status": "safe",
+      "timestamp": "2026-03-19 14:39:01"
+    },
+    {
+      "test_id": 6,
+      "mutations": {
+        "PyJWT": "2.3.0"
+      },
+      "status": "safe",
+      "timestamp": "2026-03-19 14:39:57"
+    },
+    {
+      "test_id": 7,
+      "mutations": {
+        "PyJWT": "2.4.0"
+      },
+      "status": "safe",
+      "timestamp": "2026-03-19 14:40:54"
+    },
+    {
+      "test_id": 8,
+      "mutations": {
+        "PyJWT": "2.5.0"
+      },
+      "status": "safe",
+      "timestamp": "2026-03-19 14:41:47"
+    },
+    {
+      "test_id": 9,
+      "mutations": {
+        "PyJWT": "2.6.0"
+      },
+      "status": "safe",
+      "timestamp": "2026-03-19 14:42:41"
+    },
+    {
+      "test_id": 10,
+      "mutations": {
+        "PyJWT": "2.7.0"
+      },
+      "status": "safe",
+      "timestamp": "2026-03-19 14:43:36"
+    },
+    {
+      "test_id": 11,
+      "mutations": {
+        "PyJWT": "2.8.0"
+      },
+      "status": "safe",
+      "timestamp": "2026-03-19 14:44:30"
+    },
+    {
+      "test_id": 38,
+      "mutations": {
+        "starlette": "0.52.1",
+        "PyJWT": "2.0.0"
+      },
+      "status": "safe",
+      "timestamp": "2026-03-19 15:01:19"
+    },
+    {
+      "test_id": 47,
+      "mutations": {
+        "fastapi": "0.135.1",
+        "PyJWT": "2.0.0"
+      },
+      "status": "safe",
+      "timestamp": "2026-03-19 15:06:52"
+    }
+  ],
+  "failed_tests": [
+    {
+      "test_id": 12,
+      "mutations": {
+        "fastapi": "0.100.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 14:45:02",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_12.txt (line 14) and starlette==0.52.1 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 13,
+      "mutations": {
+        "fastapi": "0.110.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 14:45:34",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_13.txt (line 14) and starlette==0.52.1 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 14,
+      "mutations": {
+        "fastapi": "0.115.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 14:46:08",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_14.txt (line 14) and starlette==0.52.1 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 15,
+      "mutations": {
+        "fastapi": "0.120.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 14:46:41",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_15.txt (line 14) and starlette==0.52.1 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 16,
+      "mutations": {
+        "fastapi": "0.125.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 14:47:14",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_16.txt (line 14) and starlette==0.52.1 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 18,
+      "mutations": {
+        "pydantic": "2.0.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 14:48:39",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_18.txt (line 14) and pydantic==2.0.0 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit https:"
+    },
+    {
+      "test_id": 19,
+      "mutations": {
+        "pydantic": "2.5.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 14:49:14",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_19.txt (line 14) and pydantic==2.5.0 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit https:"
+    },
+    {
+      "test_id": 20,
+      "mutations": {
+        "pydantic": "2.8.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 14:49:47",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_20.txt (line 29) and pydantic_core==2.41.5 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit "
+    },
+    {
+      "test_id": 21,
+      "mutations": {
+        "pydantic": "2.10.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 14:50:21",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_21.txt (line 29) and pydantic_core==2.41.5 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit "
+    },
+    {
+      "test_id": 22,
+      "mutations": {
+        "starlette": "0.30.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 14:50:54",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_22.txt (line 14) and starlette==0.30.0 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 23,
+      "mutations": {
+        "starlette": "0.35.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 14:51:25",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_23.txt (line 14) and starlette==0.35.0 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 24,
+      "mutations": {
+        "starlette": "0.40.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 14:51:57",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_24.txt (line 14) and starlette==0.40.0 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 25,
+      "mutations": {
+        "starlette": "0.45.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 14:52:31",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_25.txt (line 14) and starlette==0.45.0 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 28,
+      "mutations": {
+        "starlette": "0.52.1",
+        "fastapi": "0.100.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 14:54:52",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_28.txt (line 14) and starlette==0.52.1 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 29,
+      "mutations": {
+        "starlette": "0.52.1",
+        "fastapi": "0.110.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 14:55:23",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_29.txt (line 14) and starlette==0.52.1 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 30,
+      "mutations": {
+        "starlette": "0.30.0",
+        "fastapi": "0.135.1"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 14:55:56",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_30.txt (line 14) and starlette==0.30.0 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 31,
+      "mutations": {
+        "starlette": "0.30.0",
+        "fastapi": "0.100.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 14:56:29",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_31.txt (line 14) and starlette==0.30.0 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 32,
+      "mutations": {
+        "starlette": "0.30.0",
+        "fastapi": "0.110.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 14:56:58",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_32.txt (line 14) and starlette==0.30.0 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 33,
+      "mutations": {
+        "starlette": "0.35.0",
+        "fastapi": "0.135.1"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 14:57:30",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_33.txt (line 14) and starlette==0.35.0 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 34,
+      "mutations": {
+        "starlette": "0.35.0",
+        "fastapi": "0.100.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 14:58:01",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_34.txt (line 14) and starlette==0.35.0 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 35,
+      "mutations": {
+        "starlette": "0.35.0",
+        "fastapi": "0.110.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 14:58:34",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_35.txt (line 14) and starlette==0.35.0 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 39,
+      "mutations": {
+        "starlette": "0.30.0",
+        "PyJWT": "1.7.1"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 15:01:47",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_39.txt (line 14) and starlette==0.30.0 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 40,
+      "mutations": {
+        "starlette": "0.30.0",
+        "PyJWT": "1.7.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 15:02:16",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_40.txt (line 14) and starlette==0.30.0 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 41,
+      "mutations": {
+        "starlette": "0.30.0",
+        "PyJWT": "2.0.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 15:02:46",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_41.txt (line 14) and starlette==0.30.0 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 42,
+      "mutations": {
+        "starlette": "0.35.0",
+        "PyJWT": "1.7.1"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 15:03:12",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_42.txt (line 14) and starlette==0.35.0 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 43,
+      "mutations": {
+        "starlette": "0.35.0",
+        "PyJWT": "1.7.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 15:03:38",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_43.txt (line 14) and starlette==0.35.0 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 44,
+      "mutations": {
+        "starlette": "0.35.0",
+        "PyJWT": "2.0.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 15:04:06",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_44.txt (line 14) and starlette==0.35.0 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 48,
+      "mutations": {
+        "fastapi": "0.100.0",
+        "PyJWT": "1.7.1"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 15:07:21",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_48.txt (line 14) and starlette==0.52.1 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 49,
+      "mutations": {
+        "fastapi": "0.100.0",
+        "PyJWT": "1.7.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 15:07:48",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_49.txt (line 14) and starlette==0.52.1 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 50,
+      "mutations": {
+        "fastapi": "0.100.0",
+        "PyJWT": "2.0.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 15:08:15",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_50.txt (line 14) and starlette==0.52.1 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 51,
+      "mutations": {
+        "fastapi": "0.110.0",
+        "PyJWT": "1.7.1"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 15:08:43",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_51.txt (line 14) and starlette==0.52.1 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 52,
+      "mutations": {
+        "fastapi": "0.110.0",
+        "PyJWT": "1.7.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 15:09:11",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_52.txt (line 14) and starlette==0.52.1 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    },
+    {
+      "test_id": 53,
+      "mutations": {
+        "fastapi": "0.110.0",
+        "PyJWT": "2.0.0"
+      },
+      "status": "installation_failed",
+      "timestamp": "2026-03-19 15:09:40",
+      "error": "ERROR: Cannot install -r fuzzing_temp/requirements_53.txt (line 14) and starlette==0.52.1 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit http"
+    }
+  ],
+  "metadata": {
+    "start_time": "2026-03-19 14:34:15",
+    "baseline_requirements": "requirements.txt",
+    "end_time": "2026-03-19 15:09:40"
+  }
+}
