@@ -1,0 +1,32 @@
+{
+  "name": "docuserve",
+  "type": "module",
+  "version": "1.0.0",
+  "description": "A workspace for uploading, storing, managing, and viewing documents, enabling teams or individuals to share files in a centralized repository.",
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "npx playwright test",
+    "test:public": "npx playwright test tests/public",
+    "test:private": "npx playwright test tests/private",
+    "test:ui": "npx playwright test --ui"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/han-digital/docuserve.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/han-digital/docuserve/issues"
+  },
+  "homepage": "https://github.com/han-digital/docuserve#readme",
+  "devDependencies": {
+    "@playwright/test": "^1.57.0",
+    "@types/node": "^25.0.3",
+    "typescript": "^5.9.3"
+  }
+}

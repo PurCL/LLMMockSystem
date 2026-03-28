@@ -1,0 +1,18 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Main Document Shape with Folded Corner -->
+  <path d="M56 24H156L216 84V216C216 229.255 205.255 240 192 240H56C42.7452 240 32 229.255 32 216V40C32 26.7452 42.7452 24 56 24Z" fill="#3B82F6"/>
+  
+  <!-- Folded Corner -->
+  <path d="M156 24V84H216" fill="#60A5FA"/>
+  
+  <!-- "Screen" / Header Graphic -->
+  <rect x="68" y="72" width="120" height="64" rx="8" fill="#EBF8FF"/>
+  <rect x="76" y="80" width="104" height="32" rx="4" fill="#1E293B"/>
+  <rect x="76" y="120" width="104" height="8" rx="4" fill="#60A5FA"/>
+
+  <!-- "DMS" Text Area Background Strip -->
+  <rect x="32" y="160" width="184" height="64" fill="#2563EB" fill-opacity="0.2"/>
+
+  <!-- "DMS" Text -->
+  <text x="124" y="208" font-family="Arial, Helvetica, sans-serif" font-weight="bold" font-size="48" fill="white" text-anchor="middle">DMS</text>
+</svg>

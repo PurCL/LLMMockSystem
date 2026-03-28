@@ -1,0 +1,14 @@
+test-results/
+__pycache__/
+.env
+.venv
+venv/
+*.pyc
+.DS_Store
+node_modules/
+playwright-report/
+src/frontend/tsconfig.test.tsbuildinfo
+*.log
+**/artifacts/
+test_result*.json
+public_diff.txt

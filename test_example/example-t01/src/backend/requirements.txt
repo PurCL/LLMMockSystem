@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+python-multipart
+sqlmodel
+psycopg2-binary
+asyncpg
+psycopg2-binary
+asyncpg
+python-docx==1.1.2
+requests
+markdown==3.7
+openpyxl==3.1.2

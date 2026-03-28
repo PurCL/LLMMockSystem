@@ -1,0 +1,153 @@
+.document-view-container {
+    height: 100%;
+    width: 100%;
+    background: #f8fafc;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+.document-view-content {
+    flex: 1;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
+    padding: 0;
+    box-sizing: border-box;
+    overflow: hidden;
+}
+
+.document-card {
+    width: 100%;
+    max-width: 1200px;
+    background: white;
+    border-radius: 0;
+    box-shadow: none;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    border-left: 1px solid #e5e7eb;
+    border-right: 1px solid #e5e7eb;
+    border-top: none;
+    border-bottom: none;
+    height: 100%;
+    max-height: 100%;
+}
+
+.document-header {
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: linear-gradient(180deg, #ffffff 0%, #fafbfc 100%);
+    z-index: 10;
+    flex-shrink: 0;
+}
+
+.document-header-left {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+.back-button {
+    background: #f3f4f6;
+    border: none;
+    border-radius: 8px;
+    padding: 0.5rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    color: #374151;
+    transition: all 0.2s ease;
+    flex-shrink: 0;
+}
+
+.back-button:hover {
+    background: #e5e7eb;
+}
+
+.file-info-divider {
+    height: 20px;
+    width: 1px;
+    background: #e5e7eb;
+}
+
+.file-icon-wrapper {
+    padding: 0.35rem;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.document-filename {
+    font-weight: 600;
+    color: #111827;
+    font-size: 0.9rem;
+}
+
+.document-filesize {
+    color: #9ca3af;
+    font-size: 0.8rem;
+}
+
+.document-actions {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    flex-shrink: 0;
+    background: white;
+    padding: 0.35rem;
+    border-radius: 10px;
+    border: 1px solid rgba(0, 0, 0, 0.06);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+.document-scroll-area {
+    flex: 1;
+    overflow-y: auto;
+    background: white;
+    display: flex;
+    flex-direction: column;
+    scrollbar-width: thin;
+    scrollbar-color: #e5e7eb transparent;
+}
+
+.document-text-content {
+    padding: 2rem 4rem;
+    background: white;
+    min-height: 100%;
+    font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+    font-size: 14px;
+    line-height: 1.6;
+    color: #1f2937;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    max-width: 900px;
+    margin: 0 auto;
+}
+
+.document-preview-placeholder {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    gap: 1rem;
+}
+
+.loading-container {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+}
+
+.loading-content {
+    text-align: center;
+}

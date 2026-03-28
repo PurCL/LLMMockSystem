@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  db:
+    image: 238280154298.dkr.ecr.us-east-1.amazonaws.com/postgres:15
+    container_name: dms_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: webapp_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data_public:/var/lib/postgresql/data
+
+  backend:
+    build: ./src/backend
+    container_name: dms_backend
+    ports:
+      - "8000:8000"
+    environment:
+      PYTHONUNBUFFERED: 1
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/webapp_db
+      INIT_SCRIPT: scripts.seed_public
+      HOST: 0.0.0.0
+      PORT: 8000
+    volumes:
+      - dms_uploads:/app/uploads
+      - ./src/backend:/app
+    depends_on:
+      - db
+
+  frontend:
+    build: ./src/frontend
+    container_name: dms_frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./src/frontend:/app
+      - /app/node_modules
+    environment:
+      - VITE_API_TARGET=http://backend:8000
+      - VITE_WS_TARGET=ws://backend:8000
+    command: npm run dev
+
+  nginx:
+    build: ./deployment/nginx
+    container_name: dms_nginx
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+      - frontend
+
+volumes:
+  postgres_data_public:
+  dms_uploads:

@@ -1,0 +1,233 @@
+.upload-page-container {
+    max-width: 900px;
+    margin: 0 auto;
+    padding-top: 2rem;
+}
+
+.upload-page-header {
+    margin-bottom: 2rem;
+}
+
+.upload-header-content {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+
+.btn-back-icon {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    padding: 0.5rem;
+    border-radius: 50%;
+    color: var(--text-secondary);
+    transition: background-color 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.btn-back-icon:hover {
+    background-color: rgba(0, 0, 0, 0.05);
+}
+
+.upload-page-title {
+    margin-bottom: 0.25rem;
+}
+
+.upload-page-subtitle {
+    color: var(--text-secondary);
+    margin: 0;
+}
+
+.upload-content-container {
+    background: white;
+    border-radius: 16px;
+    padding: 2rem;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
+    min-height: 400px;
+}
+
+/* Drop Zone Styles */
+/* Drop Zone Styles - Premium style inherited from App.css */
+/* Minimal overrides if needed */
+.drop-zone-premium {
+    cursor: pointer;
+    transition: all 0.2s ease;
+    background: #f8fafc;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 300px;
+    /* App.css handles border and radius */
+}
+
+.drop-zone-premium:hover {
+    /* App.css handles hover styles */
+}
+
+.drop-zone-premium.error {
+    /* App.css handles error styles */
+}
+
+/* Icon Wrapper - Relying on structure, slight override for margins if needed */
+.icon-wrapper-premium {
+    background: white;
+    padding: 1rem;
+    border-radius: 50%;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+    margin-bottom: 1.5rem;
+    color: #6366f1;
+}
+
+.upload-text-main {
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 0.5rem;
+}
+
+.upload-text-sub {
+    color: var(--text-secondary);
+    font-size: 0.95rem;
+}
+
+/* File Card Styles */
+.file-card-premium {
+    text-align: center;
+    padding: 2rem;
+    animation: fadeIn 0.3s ease-out;
+}
+
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(10px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.file-icon-large {
+    color: #6366f1;
+    margin-bottom: 1.5rem;
+    display: inline-flex;
+    padding: 1rem;
+    background: #eff6ff;
+    border-radius: 16px;
+}
+
+.file-name {
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: var(--text-primary);
+    margin-bottom: 0.5rem;
+}
+
+.file-size-badge {
+    background: #f1f5f9;
+    padding: 4px 12px;
+    border-radius: 12px;
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+    display: inline-block;
+}
+
+/* Progress Bar */
+.progress-container {
+    max-width: 400px;
+    margin: 2rem auto 0;
+}
+
+.progress-bar-premium {
+    height: 8px;
+    background: #e2e8f0;
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.progress-fill-premium {
+    height: 100%;
+    background: #6366f1;
+    border-radius: 4px;
+    transition: width 0.3s ease;
+}
+
+.progress-text-row {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 0.5rem;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+/* Action Buttons */
+.modal-actions {
+    display: flex;
+    justify-content: center;
+    margin-top: 3rem;
+    gap: 1rem;
+}
+
+.btn-cancel {
+    padding: 0.75rem 1.5rem;
+    height: auto;
+    background: var(--bg-color);
+    color: var(--text-secondary);
+}
+
+.btn-upload {
+    padding: 0.75rem 2.5rem;
+    height: auto;
+    font-size: 1rem;
+    border-radius: 12px;
+    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.25);
+    background-color: #6366f1;
+    color: white;
+    border: none;
+    cursor: pointer;
+    font-weight: 600;
+    transition: transform 0.1s;
+}
+
+.btn-upload:active {
+    transform: scale(0.98);
+}
+
+.btn-upload:disabled {
+    opacity: 0.7;
+    cursor: not-allowed;
+}
+
+/* Footer & Error */
+.upload-footer {
+    text-align: center;
+    margin-top: 3rem;
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+}
+
+.upload-footer p {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+}
+
+.error-message {
+    margin-top: 2rem;
+    padding: 1rem;
+    background: #fef2f2;
+    border: 1px solid #fee2e2;
+    border-radius: 12px;
+    color: #ef4444;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+}

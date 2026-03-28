@@ -1,0 +1,74 @@
+# =====================================================================
+# LLM Mock System - Whitelist of Underlying Foundation Libraries 
+# (These will be installed normally and WILL NOT be mocked)
+# =====================================================================
+
+# 1. Testing & Package basics
+pytest
+_pytest
+pluggy
+mock
+unittest
+setuptools
+pkg_resources
+pip
+wheel
+
+# 2. Async & Network foundation
+brotli
+brotlicffi
+backports
+h2
+socksio
+trio
+uvloop
+httptools
+websockets
+watchfiles
+
+# 3. Parsers & Utils underlying validators
+colorama
+dotenv
+jinja2
+sniffio
+zstandard
+fqdn
+rfc3987
+webcolors
+jsonpointer
+uri_template
+rfc3986_validator
+rfc3987_syntax
+strict_rfc3339
+aniso8601
+rich
+anyio
+
+# 4. Web Frameworks (Flask & Cheroot ecosystem, highly coupled)
+flask
+werkzeug
+click
+flask_themes2
+flask_babel
+flask_caching
+flask_compress
+flask_session
+cheroot
+blinker
+six
+itsdangerous
+jaraco
+jaraco.functools
+jaraco_functools
+markupsafe
+fastapi
+starlette
+uvicorn
+pydantic
+requests
+
+# 5. JS Engines & Parsers (Critical for vulnerability triggering)
+js2py
+pyjsparser
+
+sqlmodel
