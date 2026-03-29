@@ -48,11 +48,6 @@ These examples serve as test cases for validating the effectiveness of the vulne
 
 ---
 
-### 💥 exploits
-Additional exploit examples and CVE benchmark data for testing purposes.
-
----
-
 ## Usage
 
 ### Running Test Examples
