@@ -81,7 +81,7 @@ This project aims to:
 - Provide tools for security researchers to identify and test vulnerability scenarios
 - Streamline the dependency management process during security testing
 
----
+<!-- ---
 
 ## Contributing
 
@@ -91,4 +91,4 @@ Contributions are welcome! Please ensure that any new test examples follow the e
 
 ## License
 
-[Add your license information here]
+[Add your license information here] -->
