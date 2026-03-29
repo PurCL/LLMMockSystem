@@ -65,6 +65,7 @@ def _update_state_and_save(patch):
 # 🎯 Fetch Requirements and Whitelist configuration paths from env
 # =====================================================================
 ALLOWED_MOCKS = set()
+REQUIRED_PACKAGES = set()  # 💡 新增：用于记录 requirements 里声明的原始包名
 req_file = os.environ.get("MOCK_REQ_FILE")
 
 # Map common PyPI package names to their corresponding import names
@@ -86,24 +87,37 @@ if req_file and os.path.exists(req_file):
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"): continue
+            # Extract the package name (ignoring version specifiers like ==, >=, etc.)
             match = re.match(r'^([A-Za-z0-9_\.-]+)', line)
             if match:
-                pkg = match.group(1).lower().replace('-', '_')
-                ALLOWED_MOCKS.add(pkg)
-                if pkg in KNOWN_ALIASES:
-                    ALLOWED_MOCKS.add(KNOWN_ALIASES[pkg])
+                raw_pkg = match.group(1)
+                REQUIRED_PACKAGES.add(raw_pkg)  # Keep the exact PyPI name for version lookup
+                
+                # Normalize for internal mock routing (e.g., PyYAML -> pyyaml)
+                pkg_normalized = raw_pkg.lower().replace('-', '_')
+                ALLOWED_MOCKS.add(pkg_normalized)
+                if pkg_normalized in KNOWN_ALIASES:
+                    ALLOWED_MOCKS.add(KNOWN_ALIASES[pkg_normalized])
 
 # =====================================================================
-# 📦 Real Dependency Scanner
+# 📦 Real Dependency Scanner (Targeted Lookup)
 # =====================================================================
 def _record_core_imports():
     try:
-        installed_packages = {
-            dist.metadata["Name"]: dist.version 
-            for dist in importlib.metadata.distributions()
-        }
-        if mock_state.get("core_imports") != installed_packages:
-            mock_state["core_imports"] = installed_packages
+        core_packages = {}
+        # Iterate only through the packages explicitly listed in requirements
+        for pkg in REQUIRED_PACKAGES:
+            try:
+                # Attempt to fetch the version of the installed package
+                version = importlib.metadata.version(pkg)
+                core_packages[pkg] = version
+            except importlib.metadata.PackageNotFoundError:
+                # Package is in requirements but NOT installed in the environment -> skip it
+                continue
+                
+        # Update the state file only if there's a difference
+        if mock_state.get("core_imports") != core_packages:
+            mock_state["core_imports"] = core_packages
             with open(STATE_FILE, "w") as f:
                 json.dump(mock_state, f, indent=4)
     except Exception:

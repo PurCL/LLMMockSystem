@@ -8,30 +8,37 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-BACKEND_DIR="$HOME/data3/LLMMockSystem/test_example/example-t01/src/backend"
+BACKEND_DIR="$HOME/data3/LLMMockSystem/test_example/project/src/backend"
 EVIDENCE_FILE="${BACKEND_DIR}/PWNED_BY_JWT_BASH.txt"
 
 SERVER_PID=""
 CONTAINER_NAME=""
 SERVER_PORT=""
 API_ENDPOINT=""
+PORT_FILE="/tmp/llm_mock_server_port.txt"
 
 # =====================================================================
 # 🧹 Unified Teardown Sequence
 # =====================================================================
 cleanup_all() {
     echo -e "\n${YELLOW}[⚙️ Teardown] Initiating system cleanup...${NC}"
-    
+
     if [ -n "$SERVER_PID" ] && kill -0 $SERVER_PID 2>/dev/null; then
         echo -e "${YELLOW}[⚙️ Teardown] Shutting down FastAPI server (PID: $SERVER_PID)...${NC}"
         kill -9 $SERVER_PID 2>/dev/null
     fi
-    
+
     if [ -n "$CONTAINER_NAME" ]; then
         echo -e "${YELLOW}[⚙️ Teardown] Stopping database container ${CONTAINER_NAME}...${NC}"
         docker stop "$CONTAINER_NAME" > /dev/null 2>&1
     fi
-    
+
+    # Clean up port file
+    if [ -f "$PORT_FILE" ]; then
+        echo -e "${YELLOW}[⚙️ Teardown] Removing port file ${PORT_FILE}...${NC}"
+        rm -f "$PORT_FILE"
+    fi
+
     echo -e "${GREEN}[⚙️ Teardown] Cleanup complete. Goodbye!${NC}"
 }
 
@@ -126,23 +133,11 @@ start_server() {
     SERVER_PORT=$(get_free_port)
     echo -e "${YELLOW}[🚀 Phase 2] 🎯 Dynamic Server Port ${SERVER_PORT} acquired...${NC}"
 
+    # Save port to temporary file for run_exploit.sh to read
+    echo "$SERVER_PORT" > "$PORT_FILE"
+    echo -e "${GREEN}[🚀 Phase 2] ✅ Port ${SERVER_PORT} saved to ${PORT_FILE}${NC}"
+
     python -m uvicorn app.main:app --host 127.0.0.1 --port $SERVER_PORT
-    
-    
-    # python -m uvicorn app.main:app --host 127.0.0.1 --port $SERVER_PORT > /tmp/uvicorn.log 2>&1 &
-    # SERVER_PID=$!
-    
-    # echo -e "${YELLOW}[🚀 Phase 2] ⏳ Waiting 3 seconds for server to start...${NC}"
-    # sleep 3
-    
-    # if kill -0 $SERVER_PID 2>/dev/null; then
-    #     echo -e "${GREEN}[🚀 Phase 2] ✅ Server started successfully on port ${SERVER_PORT} (PID: ${SERVER_PID})!${NC}"
-        
-    #     API_ENDPOINT="http://127.0.0.1:${SERVER_PORT}/api/documents/upload"
-    # else
-    #     echo -e "${RED}[🚀 Phase 2] ❌ Server failed to start. Check /tmp/uvicorn.log for details.${NC}"
-    #     exit 1
-    # fi
 }
 
 # =====================================================================
