@@ -77,7 +77,7 @@ python main.py --reset <path_to_requirements.txt>
 
 ### Resolve Dependencies
 
-Analyzes API usage patterns to determine compatible package versions.
+Analyzes API usage patterns to determine compatible package versions and generates Dockerfiles for testing.
 
 **Syntax:**
 ```bash
@@ -93,9 +93,39 @@ python main.py --resolve /path/to/.mock_state.json
 2. For each mocked import, fetches available versions from PyPI
 3. Uses LLM inference to filter versions compatible with the observed API usage
 4. Generates `resolved_versions.json` with the final configuration
+5. Interactively generates Dockerfiles for different package version combinations
+6. Creates a README with detailed usage instructions in the `generated_dockerfiles/` directory
 
 **Output:**
 - `resolved_versions.json`: Contains package names mapped to compatible versions
+- `generated_dockerfiles/`: Directory containing generated Dockerfiles and usage instructions
+  - `Dockerfile_1`, `Dockerfile_2`, etc.: Docker configurations for different package combinations
+  - `README.md`: Detailed instructions on how to build and use the containers
+
+**Docker Container Design:**
+The generated Dockerfiles create containers that:
+- Install only the specified package versions with `--no-deps` flag (no transitive dependencies)
+- Stay running in the background using `CMD ["tail", "-f", "/dev/null"]`
+- Allow manual interaction via `docker exec` or interactive mode
+- Do NOT automatically execute any application code
+- Enable you to enter the container and run your tests/applications manually
+
+**Using the Generated Dockerfiles:**
+```bash
+# Build a Docker image
+cd generated_dockerfiles
+docker build -f Dockerfile_1 -t myapp:v1 .
+
+# Run in background and exec into it
+docker run -d --name myapp_container myapp:v1
+docker exec -it myapp_container /bin/bash
+
+# Or run directly in interactive mode
+docker run -it --rm myapp:v1 /bin/bash
+
+# With volume mounting (to access your project files)
+docker run -it --rm -v /path/to/project:/app/project myapp:v1 /bin/bash
+```
 
 ## 📁 File Structure
 
