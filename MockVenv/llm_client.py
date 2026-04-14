@@ -44,21 +44,44 @@ def _run_sync(async_func, *args, **kwargs):
 # =====================================================================
 # 🛠️ Base LLM Communication Channel
 # =====================================================================
-async def _ask_claude(prompt: str, system_prompt: str) -> str:
-    options = ClaudeAgentOptions(
-        model='global.anthropic.claude-sonnet-4-5-20250929-v1:0',
-        system_prompt=system_prompt,
-        allowed_tools=[], 
-        permission_mode='acceptEdits',
-        cwd=os.getcwd(),
-        max_turns=3
-    )
+async def _ask_claude(prompt: str, system_prompt: str, disable_write: bool = False) -> str:
+    """
+    Base async function to communicate with Claude.
+
+    Args:
+        prompt: The user prompt/query
+        system_prompt: System instructions for Claude
+        disable_write: If True, disables Write and other file creation tools
+
+    Returns:
+        The final text response from Claude
+    """
+    # Base configuration
+    options_dict = {
+        'model': 'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+        'system_prompt': system_prompt,
+        'allowed_tools': [],
+        'permission_mode': 'acceptEdits',
+        'cwd': os.getcwd(),
+        'max_turns': 3
+    }
+
+    # If write is disabled, add disallowed tools
+    if disable_write:
+        options_dict['disallowed_tools'] = [
+            'Write',           # Prevent creating/overwriting files
+            'Edit',            # Prevent editing existing files
+            'NotebookEdit',    # Prevent editing notebooks
+            'Bash',            # Prevent bash commands that could write files
+        ]
+
+    options = ClaudeAgentOptions(**options_dict)
 
     final_result = ''
     async for message in query(prompt=prompt, options=options):
         if type(message).__name__ == "ResultMessage" and message.result:
             final_result = message.result
-            
+
     return final_result
 
 # =====================================================================
@@ -101,17 +124,17 @@ def infer_versions(prompt: str) -> list:
         "Output ONLY a single JSON array of strings representing compatible versions. "
         "Do NOT wrap it in markdown blockquotes (like ```json)."
     )
-    
+
     try:
         raw_response = _run_sync(_ask_claude, prompt, sys_prompt)
-        
+
         # Clean and parse the JSON array response
         clean_value = raw_response.strip()
         clean_value = re.sub(r'^```[a-zA-Z]*\n', '', clean_value)
         clean_value = re.sub(r'\n```$', '', clean_value)
         match = re.search(r'\[.*\]', clean_value, re.DOTALL)
         res_str = match.group(0) if match else clean_value
-        
+
         valid_versions = json.loads(res_str)
         if isinstance(valid_versions, list):
             return valid_versions
@@ -119,3 +142,94 @@ def infer_versions(prompt: str) -> list:
     except Exception as e:
         print(f"   ❌ [LLM Error] Failed to infer versions: {e}")
         return []
+
+
+# =====================================================================
+# 🚀 Business Logic 3: Dockerfile & README Generation (For resolve_dependencies.py)
+# =====================================================================
+def generate_dockerfile_content(combination: dict, base_image: str = "python:3.11-slim", project_path: str = None) -> dict:
+    """
+    Use LLM to generate Dockerfile and README content (WITHOUT writing files).
+
+    Args:
+        combination: dict {package_name: version}
+        base_image: Docker base image to use
+        project_path: Optional path to project directory for volume mounting
+
+    Returns:
+        dict with keys:
+            - 'dockerfile': str (Dockerfile content)
+            - 'readme_section': str (README section for this configuration)
+    """
+    sys_prompt = (
+        "SYSTEM: [STRICT_JSON_ONLY_MODE]\n"
+        "You are a machine-to-machine API. YOU MUST NOT WRITE ANY FILES.\n"
+        "You MUST NOT use Write, Edit, or any file writing tools.\n"
+        "Output ONLY a single JSON object with the following structure:\n"
+        "{\n"
+        '  "dockerfile": "string containing the complete Dockerfile content",\n'
+        '  "readme_section": "string containing the README section for this configuration"\n'
+        "}\n"
+        "Do NOT wrap it in markdown blockquotes (like ```json)."
+    )
+
+    # Build the prompt with package information
+    packages_list = '\n'.join([f"  - {pkg}=={ver}" for pkg, ver in combination.items()])
+
+    prompt = f"""Generate a Dockerfile and README section for the following configuration:
+
+Base Image: {base_image}
+Packages to install (with --no-deps flag):
+{packages_list}
+
+{"Project Path: " + project_path if project_path else "No project path specified"}
+
+Requirements:
+1. Dockerfile should:
+   - Use FROM {base_image}
+   - Set WORKDIR /app
+   - Install packages with --no-deps flag (no transitive dependencies)
+   - Use CMD ["tail", "-f", "/dev/null"] to keep container running
+   - DO NOT include any application startup commands
+   - The container should stay alive so users can exec into it
+
+2. README section should include:
+   - Configuration summary (which packages and versions)
+   - Build command example
+   - Run command examples:
+     * Background run: docker run -d <image>
+     * Interactive access: docker run -it <image> /bin/bash
+     * Exec into running container: docker exec -it <container_id> /bin/bash
+   - {"Volume mount instructions with absolute path: " + project_path if project_path else "Note that users can mount volumes as needed"}
+   - Important notes about --no-deps flag
+   - Emphasize that the container is meant for manual interaction, not automatic execution
+
+Output as JSON with keys "dockerfile" and "readme_section".
+"""
+
+    try:
+        raw_response = _run_sync(_ask_claude, prompt, sys_prompt, disable_write=True)
+
+        # Clean and parse the JSON response
+        clean_value = raw_response.strip()
+        clean_value = re.sub(r'^```json\s*', '', clean_value)
+        clean_value = re.sub(r'^```\s*', '', clean_value)
+        clean_value = re.sub(r'\s*```$', '', clean_value)
+        match = re.search(r'\{.*\}', clean_value, re.DOTALL)
+        res_str = match.group(0) if match else clean_value
+
+        result = json.loads(res_str)
+
+        # Validate the response structure
+        if not isinstance(result, dict) or 'dockerfile' not in result or 'readme_section' not in result:
+            raise ValueError("LLM response missing required keys")
+
+        return result
+
+    except Exception as e:
+        print(f"   ❌ [LLM Error] Failed to generate Dockerfile content: {e}")
+        # Fallback: return empty template
+        return {
+            "dockerfile": f"FROM {base_image}\nWORKDIR /app\n# Error generating content\n",
+            "readme_section": "# Configuration failed to generate\n"
+        }

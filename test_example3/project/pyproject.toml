@@ -1,0 +1,55 @@
+[project]
+name = "lollms-webui"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "ascii-colors>=0.1.4",
+    "beautifulsoup4>=4.13.5",
+    "colorama>=0.4.6",
+    "fastapi>=0.116.1",
+    "freedom-search",
+    "gitpython==3.1.44",
+    "lollms",
+    "lollmsvectordb==1.3.8",
+    "numpy<2.0.0",
+    "packaging>=25.0",
+    "pandas>=2.3.2",
+    "pillow>=9.5.0",
+    "psutil>=7.0.0",
+    "pydantic>=2.11.7",
+    "pytest>=8.4.1",
+    "python-multipart>=0.0.20",
+    "python-socketio[asyncio-client,client]>=5.13.0",
+    "pyyaml>=6.0.2",
+    "rich>=14.1.0",
+    "safe-store",
+    "scipy>=1.15.3",
+    "selenium>=4.35.0",
+    "torch==2.6.0+cpu",
+    "tqdm>=4.67.1",
+    "transformers==4.49.0",
+    "uvicorn>=0.35.0",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+safe-store = { workspace = true }
+lollms = { workspace = true }
+
+[[tool.uv.index]]
+name = "default"
+url = "https://pypi.org/simple"
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cpu"
+
+[tool.uv.workspace]
+members = [
+    "lollms_core",
+    "utilities/safe_store",
+]
+
+

@@ -1,0 +1,23 @@
+[project]
+name = "safe-store"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "ascii-colors>=0.11.4",
+    "beautifulsoup4>=4.13.5",
+    "dpkt>=1.9.8",
+    "matplotlib>=3.10.5",
+    "mplcursors>=0.6",
+    "pandas>=2.3.2",
+    "pypdf2>=3.0.1",
+    "python-docx>=1.2.0",
+    "python-pptx>=1.0.2",
+    "scikit-learn>=1.7.1",
+    "seaborn>=0.13.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
