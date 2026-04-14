@@ -211,9 +211,8 @@ Examples:
 
     group.add_argument(
         "--reset",
-        metavar="REQUIREMENTS_FILE",
-        type=str,
-        help="Reset the virtual environment using the specified requirements.txt file"
+        action="store_true",
+        help="Reset the virtual environment (requires --requirements file path)"
     )
 
     parser.add_argument(
@@ -257,7 +256,9 @@ Examples:
 
     # Execute the appropriate operation based on user input
     if args.reset:
-        reset_environment(args.reset, mode=args.mode)
+        if not args.requirements:
+            parser.error("--reset requires the --requirements argument to specify the requirements file.")
+        reset_environment(args.requirements, mode=args.mode)
     elif args.resolve:
         # Determine if LLM should be used based on mode and user flags
         # In 'real' mode: default to template-based generation (use_llm=False)
