@@ -9,12 +9,10 @@ import shutil
 # =====================================================================
 # ⚙️ Configuration
 # =====================================================================
-# Mapping internal import names to official PyPI package names
-PYPI_NAME_MAP = {
-    "jwt": "PyJWT",
-    "yaml": "PyYAML",
-    "dotenv": "python-dotenv"
-}
+# Global variable to store PyPI import mapping (loaded from JSON file)
+# Format: {pypi_package_name: import_name}
+# Example: {"pyyaml": "yaml", "pyjwt": "jwt", "python-dotenv": "dotenv"}
+PYPI_IMPORT_MAPPING = {}
 
 # =====================================================================
 # 🗺️ PyPI Import Mapping Loader
@@ -22,7 +20,7 @@ PYPI_NAME_MAP = {
 def load_pypi_import_mapping(mapping_file="pypi_import_mapping.json"):
     """
     Load PyPI package name to import name mapping from JSON file.
-    This is the same mapping used in llm_mock_hook.py for package alias resolution.
+    This is the same mapping used in llm_real_hook.py for package alias resolution.
 
     Returns:
         dict: {pypi_package_name: import_name}
@@ -39,6 +37,69 @@ def load_pypi_import_mapping(mapping_file="pypi_import_mapping.json"):
     except Exception as e:
         print(f"⚠️ Failed to load mapping file {mapping_file}: {e}")
         return {}
+
+def _resolve_pypi_name_from_import(import_name):
+    """
+    Resolve an import name to its PyPI package name using the mapping.
+    This is the reverse operation of llm_real_hook.py's _resolve_import_name.
+
+    Args:
+        import_name: The import name used in code (e.g., 'yaml', 'jwt', 'dotenv')
+
+    Returns:
+        The PyPI package name (e.g., 'PyYAML', 'PyJWT', 'python-dotenv'),
+        or the original import_name if no mapping found
+    """
+    if not PYPI_IMPORT_MAPPING:
+        return import_name
+
+    # Normalize the import name for lookup
+    normalized = import_name.lower().replace('-', '_')
+
+    # Build reverse mapping: import_name -> list of pypi_package_names
+    # We need to handle cases where multiple PyPI packages map to the same import name
+    reverse_mapping = {}
+    for pypi_pkg, import_alias in PYPI_IMPORT_MAPPING.items():
+        import_key = import_alias.lower().replace('-', '_')
+        if import_key not in reverse_mapping:
+            reverse_mapping[import_key] = []
+        reverse_mapping[import_key].append(pypi_pkg)
+
+    # Try direct lookup with normalized name
+    if normalized in reverse_mapping:
+        candidates = reverse_mapping[normalized]
+        # If multiple candidates, prefer the one with hyphens (more canonical)
+        # and prefer shorter names (base packages over variants)
+        candidates_sorted = sorted(candidates, key=lambda x: (
+            0 if '-' in x else 1,  # Prefer hyphenated names
+            len(x),                # Prefer shorter names
+            x                      # Alphabetical as tiebreaker
+        ))
+        return candidates_sorted[0]
+
+    # Try with hyphen version
+    hyphenated = import_name.lower().replace('_', '-')
+    if hyphenated in reverse_mapping:
+        candidates = reverse_mapping[hyphenated]
+        candidates_sorted = sorted(candidates, key=lambda x: (
+            0 if '-' in x else 1,
+            len(x),
+            x
+        ))
+        return candidates_sorted[0]
+
+    # Try original case-insensitive lookup
+    for import_alias, pypi_name in PYPI_IMPORT_MAPPING.items():
+        if import_alias.lower() == import_name.lower():
+            return pypi_name
+
+    # Check if it's already a PyPI package name (direct match)
+    for pypi_name in PYPI_IMPORT_MAPPING.keys():
+        if pypi_name.lower() == normalized or pypi_name.lower() == hyphenated:
+            return pypi_name
+
+    # No mapping found, return original name
+    return import_name
 
 def resolve_import_to_pypi_name(import_name, pypi_import_mapping):
     """
@@ -80,19 +141,27 @@ def resolve_import_to_pypi_name(import_name, pypi_import_mapping):
     if hyphenated in pypi_import_mapping:
         return hyphenated
 
-    # Check with manual mapping
-    if import_name in PYPI_NAME_MAP:
-        return PYPI_NAME_MAP[import_name]
-
-    # No mapping found, return original name
-    return import_name
+    # Check with the loaded mapping using the new resolver
+    return _resolve_pypi_name_from_import(import_name)
 
 # =====================================================================
 # 📦 PyPI Fetcher & Deductive Logic
 # =====================================================================
-def get_pypi_versions(package_name):
-    """Fetch all available versions for a package in real-time via the PyPI API."""
-    pypi_name = PYPI_NAME_MAP.get(package_name, package_name)
+def get_pypi_versions(package_name, resolve_name=True, return_canonical_name=False, filter_prereleases=False):
+    """
+    Fetch all available versions for a package in real-time via the PyPI API.
+
+    Args:
+        package_name: Package name (import name or PyPI name)
+        resolve_name: If True, resolve import name to PyPI name. If False, use package_name as-is.
+        return_canonical_name: If True, return tuple (canonical_name, versions). If False, return only versions.
+        filter_prereleases: If True, filter out pre-release versions (alpha, beta, rc). Default False.
+
+    Returns:
+        If return_canonical_name=False: List of version strings sorted newest to oldest
+        If return_canonical_name=True: Tuple of (canonical_package_name, list of versions)
+    """
+    pypi_name = _resolve_pypi_name_from_import(package_name) if resolve_name else package_name
     print(f"🔍 Fetching all versions for '{pypi_name}' from PyPI...")
 
     url = f"https://pypi.org/pypi/{pypi_name}/json"
@@ -100,12 +169,129 @@ def get_pypi_versions(package_name):
         req = urllib.request.Request(url)
         with urllib.request.urlopen(req, timeout=5) as response:
             data = json.loads(response.read())
-            # Filter out pre-release versions (alpha, beta, rc) to ensure baseline stability
-            versions = [v for v in data["releases"].keys() if "rc" not in v and "b" not in v and "a" not in v]
-            return sorted(versions, reverse=True)
+            # Get the official/canonical package name from PyPI
+            canonical_name = data["info"]["name"]
+
+            # Get all versions from releases
+            all_releases = list(data["releases"].keys())
+
+            # Optionally filter out pre-release versions
+            if filter_prereleases:
+                # More sophisticated pre-release detection
+                versions = []
+                for v in all_releases:
+                    v_lower = v.lower()
+                    # Skip versions with common pre-release identifiers
+                    if any(pre in v_lower for pre in ['rc', 'beta', 'alpha', 'dev', 'a0', 'b0', 'c0']):
+                        continue
+                    versions.append(v)
+            else:
+                versions = all_releases
+
+            sorted_versions = sorted(versions, reverse=True)
+
+            if return_canonical_name:
+                return canonical_name, sorted_versions
+            return sorted_versions
     except Exception as e:
         print(f"⚠️ Failed to fetch versions for '{pypi_name}': {e}")
+        if return_canonical_name:
+            return package_name, []
         return []
+
+
+def analyze_api_signatures_for_hints(package_name, api_signatures, all_versions):
+    """
+    Use LLM to analyze API signatures and provide intelligent version hints.
+
+    This is a GENERAL-PURPOSE analyzer that works for any package by leveraging
+    LLM's knowledge of package version histories and API evolution patterns.
+
+    Args:
+        package_name: Name of the package
+        api_signatures: List of API call signatures
+        all_versions: List of all available versions from PyPI
+
+    Returns:
+        dict with LLM-generated analysis results
+    """
+    if not api_signatures or not all_versions:
+        return {
+            "detected_patterns": [],
+            "version_constraints": None,
+            "confidence": "low",
+            "reasoning": "Insufficient data for analysis"
+        }
+
+    pypi_name = _resolve_pypi_name_from_import(package_name)
+
+    # Prepare prompt for LLM analysis
+    prompt = f"""You are a Python package version analyzer with deep knowledge of PyPI packages and their API evolution.
+
+Package: {pypi_name}
+Available Versions: {all_versions[:30] if len(all_versions) > 30 else all_versions}
+{'(Showing first 30 of ' + str(len(all_versions)) + ' versions)' if len(all_versions) > 30 else ''}
+
+Observed API Signatures (sample):
+{chr(10).join(api_signatures[:20])}
+{'(Showing first 20 of ' + str(len(api_signatures)) + ' signatures)' if len(api_signatures) > 20 else ''}
+
+TASK: Analyze these API signatures to identify version-specific patterns.
+
+Look for indicators such as:
+1. **Deprecated parameters**: Parameters that were removed or renamed in certain versions
+   - Example: PyJWT's `verify` parameter (existed in <2.0, changed to `options` in >=2.0)
+
+2. **New parameters**: Parameters that were added in specific versions
+   - Example: New optional parameters introduced in major versions
+
+3. **Method/class availability**: APIs that only exist in certain version ranges
+   - Example: New methods added in v2.0+, old methods removed in v3.0+
+
+4. **Signature changes**: Parameter order changes, type hint changes, or default value changes
+
+5. **Breaking changes**: Major version bumps that typically introduce incompatibilities
+
+Based on your analysis, return a JSON object with this structure:
+{{
+  "detected_patterns": ["list of specific patterns you detected"],
+  "version_constraints": "suggested version constraint (e.g., '<2.0', '>=2.5', '>=1.0,<2.0') or null if no strong constraint",
+  "confidence": "high/medium/low",
+  "reasoning": "clear explanation of why you suggested this constraint"
+}}
+
+IMPORTANT:
+- Only suggest version constraints if you detect CLEAR breaking change indicators
+- If APIs appear stable across versions, return confidence: "low" and version_constraints: null
+- Be conservative: prefer no constraint over incorrect constraint
+- Focus on ACTUAL API compatibility, not just guessing
+
+Your response (JSON only):"""
+
+    try:
+        # Use LLM to analyze the patterns
+        print(f"   🧠 [Pattern Analyzer] Asking LLM to analyze API patterns for {pypi_name}...")
+        result = llm_client.analyze_api_patterns(prompt)
+
+        if result and isinstance(result, dict):
+            print(f"   💡 [Pattern Analyzer] Confidence: {result.get('confidence', 'unknown')}")
+            return result
+        else:
+            print(f"   ⚠️ [Pattern Analyzer] Failed to get valid response")
+            return {
+                "detected_patterns": [],
+                "version_constraints": None,
+                "confidence": "low",
+                "reasoning": "LLM analysis failed"
+            }
+    except Exception as e:
+        print(f"   ⚠️ [Pattern Analyzer] Error during analysis: {e}")
+        return {
+            "detected_patterns": [],
+            "version_constraints": None,
+            "confidence": "low",
+            "reasoning": f"Analysis error: {e}"
+        }
 
 
 def parse_api_calls_from_text(api_calls_text):
@@ -176,18 +362,55 @@ def infer_versions_from_llm(package_name, api_signatures, requirements_versions=
         api_signatures: List of API call signatures (e.g., ["semver.VersionInfo()", ...])
         requirements_versions: Optional list of versions from requirements.txt to constrain search
     """
-    pypi_name = PYPI_NAME_MAP.get(package_name, package_name)
-    all_versions = get_pypi_versions(pypi_name)
+    pypi_name = _resolve_pypi_name_from_import(package_name)
+    # Get all versions including pre-releases initially for better debugging
+    # Also get the canonical name from PyPI to ensure case-correct matching
+    # Use resolve_name=False since we already resolved the name above
+    canonical_name, all_versions_raw = get_pypi_versions(pypi_name, resolve_name=False, return_canonical_name=True)
 
-    if not all_versions:
+    if not all_versions_raw:
         return []
 
-    # If we have requirements.txt constraints, filter versions first
-    if requirements_versions:
-        all_versions = [v for v in all_versions if v in requirements_versions]
-        if not all_versions:
-            print(f"   ⚠️ No versions from requirements.txt found in PyPI for '{pypi_name}'")
-            return []
+    # If we have requirements.txt constraints, use those versions directly
+    # if requirements_versions:
+    #     # For pinned versions (from requirements.txt), we should use them as-is
+    #     # and not filter them further with LLM analysis
+    #     print(f"   📋 Using pinned versions from requirements.txt: {requirements_versions}")
+
+    #     # Validate that the required versions exist in PyPI (case-insensitive check)
+    #     validated_versions = []
+    #     for req_ver in requirements_versions:
+    #         # Try exact match first
+    #         if req_ver in all_versions_raw:
+    #             validated_versions.append(req_ver)
+    #         else:
+    #             # Try case-insensitive and whitespace-tolerant match
+    #             req_ver_normalized = req_ver.strip().lower()
+    #             found = False
+    #             for pypi_ver in all_versions_raw:
+    #                 if pypi_ver.strip().lower() == req_ver_normalized:
+    #                     validated_versions.append(pypi_ver)
+    #                     found = True
+    #                     break
+
+    #             if not found:
+    #                 print(f"   ⚠️ Warning: Version '{req_ver}' from requirements.txt not found in PyPI")
+    #                 print(f"   💡 Attempting to use it anyway (PyPI may accept it)")
+    #                 # Still include the version even if not found in the filtered list
+    #                 # because PyPI's pre-release filter might have excluded it
+    #                 validated_versions.append(req_ver)
+
+    #     if not validated_versions:
+    #         print(f"   ⚠️ No versions from requirements.txt found in PyPI for '{canonical_name}'")
+    #         print(f"   📋 Requirements.txt versions: {requirements_versions}")
+    #         print(f"   📦 Available PyPI versions (first 20): {all_versions_raw[:20]}")
+    #         return []
+
+    #     # For requirements.txt pinned versions, skip LLM analysis and return directly
+    #     return validated_versions
+
+    # If no requirements.txt constraints, proceed with all versions
+    all_versions = all_versions_raw
 
     if not api_signatures:
         return all_versions
@@ -195,33 +418,83 @@ def infer_versions_from_llm(package_name, api_signatures, requirements_versions=
     print(f"🧠 [LLM Engine] Analyzing API signatures for '{package_name}'...")
     print(f"   📊 Analyzing {len(api_signatures)} API calls against {len(all_versions)} versions")
 
-    # The prompt explicitly asks the LLM to filter versions based on API signatures
+    # Analyze signatures for version hints using LLM
+    hints = analyze_api_signatures_for_hints(package_name, api_signatures, all_versions)
+    if hints["confidence"] in ["high", "medium"]:
+        print(f"   🔍 Detected patterns: {', '.join(hints['detected_patterns'])}")
+        if hints.get('version_constraints'):
+            print(f"   💡 Version hint: {hints['version_constraints']}")
+        print(f"   📝 Reasoning: {hints.get('reasoning', 'N/A')}")
+
+    # Enhanced prompt with better guidance on version range inference
+    # Build hints section dynamically based on LLM pattern analysis
+    hints_section = ""
+    if hints['confidence'] in ['high', 'medium']:
+        hints_section = f"""
+PATTERN ANALYSIS RESULTS (Confidence: {hints['confidence'].upper()}):
+{chr(10).join([f"- Detected Pattern: {p}" for p in hints['detected_patterns']]) if hints['detected_patterns'] else "- No specific patterns detected"}
+{f"- Suggested Version Constraint: {hints['version_constraints']}" if hints.get('version_constraints') else "- No version constraint suggested"}
+- Analysis Reasoning: {hints.get('reasoning', 'N/A')}
+"""
+
     prompt = f"""You are an expert Python Dependency Resolution Engine with deep knowledge of PyPI packages and their version histories.
 
-Target Package: {pypi_name}
-All Available Versions on PyPI (sorted by recency): {all_versions[:20] if len(all_versions) > 20 else all_versions}
-{'(Showing first 20 of ' + str(len(all_versions)) + ' versions)' if len(all_versions) > 20 else ''}
+TARGET PACKAGE: {canonical_name}
 
-Observed API Signatures from actual code execution (Total: {len(api_signatures)}):
+AVAILABLE VERSIONS (sorted newest to oldest):
+{all_versions[:30] if len(all_versions) > 30 else all_versions}
+{'>>> Showing first 30 of ' + str(len(all_versions)) + ' total versions' if len(all_versions) > 30 else ''}
+
+OBSERVED API SIGNATURES (from actual runtime execution):
+Total API calls: {len(api_signatures)}
 {chr(10).join(api_signatures[:30])}
-{'(Showing first 30 of ' + str(len(api_signatures)) + ' signatures)' if len(api_signatures) > 30 else ''}
+{'>>> Showing first 30 signatures' if len(api_signatures) > 30 else ''}
+{hints_section}
 
-TASK:
-Analyze these API signatures and determine which versions of {pypi_name} support ALL of these APIs.
-Filter the "All Available Versions" list to ONLY include versions where these exact API signatures are valid and will not raise AttributeError or TypeError.
+═══════════════════════════════════════════════════════════════
+TASK: VERSION COMPATIBILITY ANALYSIS
+═══════════════════════════════════════════════════════════════
 
-Critical considerations:
-1. Method signatures and their parameters (parameter names, default values, required vs optional)
-2. Class constructors and their arguments
-3. Deprecated or removed APIs in newer versions
-4. APIs that were added in newer versions (older versions won't have them)
-5. Changes in method behavior across versions
-6. Breaking changes in major version updates
+Your mission: Identify ALL versions of {canonical_name} that are compatible with the observed API signatures above.
 
-Be conservative: if you're uncertain about a version's compatibility, exclude it.
-Return ONLY a JSON array of compatible version strings, ordered from newest to oldest.
+ANALYSIS METHODOLOGY:
 
-Example output format: ["1.7.1", "1.7.0", "1.6.3"]
+1. **API Signature Examination**:
+   - Examine each API call for version-specific indicators
+   - Look for deprecated/renamed parameters across version history
+   - Identify methods/classes that were added or removed in certain versions
+   - Pay attention to parameter types, default values, and calling conventions
+
+2. **Breaking Change Detection**:
+   - Major version bumps (e.g., 1.x → 2.x) often introduce breaking changes
+   - API deprecations typically happen across major versions
+   - Parameter renames, signature changes, or removed methods indicate incompatibility
+   - Only exclude versions with CONFIRMED incompatibilities
+
+3. **Version Range Strategy**:
+   - **DEFAULT APPROACH: Return BROAD ranges when APIs are stable**
+   - If an API pattern is stable across v1.0-v1.9, include ALL those versions
+   - Don't artificially narrow the range without evidence of breaking changes
+   - Multiple compatible versions are MORE valuable than a single version
+
+4. **Confidence Calibration**:
+   - High confidence: Clear breaking changes detected (e.g., parameter renames)
+   - Medium confidence: Partial evidence (e.g., major version pattern)
+   - Low confidence: Stable APIs across versions → return wider range
+
+5. **Evidence-Based Reasoning**:
+   - Base decisions on actual API compatibility, not speculation
+   - If pattern analysis suggests a constraint, validate it against the API signatures
+   - When in doubt, include the version (false positives better than false negatives)
+
+═══════════════════════════════════════════════════════════════
+OUTPUT FORMAT
+═══════════════════════════════════════════════════════════════
+
+Return ONLY a JSON array of compatible version strings (newest to oldest).
+Include ALL versions that could reasonably support these API patterns.
+
+Example: ["2.1.0", "2.0.9", "2.0.8", "2.0.7", "2.0.6", "2.0.5", "2.0.4"]
 
 Your response (JSON array only):"""
 
@@ -236,17 +509,36 @@ Your response (JSON array only):"""
     return all_versions
 
 
+def _resolve_requirements_package_name(package_name):
+    """
+    Resolve a package name from requirements.txt to its canonical PyPI name by querying PyPI API.
+    This handles cases where requirements.txt uses lowercase names (e.g., 'pyjwt')
+    but PyPI requires the canonical form (e.g., 'PyJWT').
+
+    Args:
+        package_name: Package name as written in requirements.txt
+
+    Returns:
+        The canonical PyPI package name (with correct casing)
+    """
+    # Query PyPI API to get the canonical name
+    canonical_name, _ = get_pypi_versions(package_name, resolve_name=False, return_canonical_name=True)
+    return canonical_name
+
+
 def load_requirements_txt(requirements_path):
     """
     Load requirements.txt and parse package names and their version constraints.
+    Package names are normalized to their canonical PyPI names by querying PyPI API.
 
-    Returns: dict {package_name: [list of allowed versions]} or {package_name: None} if all versions allowed
+    Returns: dict {canonical_package_name: [list of allowed versions]} or {canonical_package_name: None} if all versions allowed
     """
     if not os.path.exists(requirements_path):
         print(f"⚠️ requirements.txt not found at: {requirements_path}")
         return {}
 
-    requirements = {}
+    # First pass: collect all package names
+    raw_requirements = []
     with open(requirements_path, 'r') as f:
         for line in f:
             line = line.strip()
@@ -254,17 +546,38 @@ def load_requirements_txt(requirements_path):
                 continue
 
             # Simple parsing - handle package==version or package>=version, etc.
-            # For now, we'll extract package name and specific version if provided
             if '==' in line:
                 parts = line.split('==')
                 package_name = parts[0].strip()
                 version = parts[1].strip()
-                requirements[package_name] = [version]
+                raw_requirements.append((package_name, [version]))
             else:
                 # If no specific version, we'll fetch all versions later
                 # Remove version specifiers
                 package_name = line.split('>=')[0].split('<=')[0].split('>')[0].split('<')[0].split('!=')[0].strip()
-                requirements[package_name] = None  # All versions allowed
+                raw_requirements.append((package_name, None))
+
+    # Second pass: normalize all package names to canonical form (with progress indicator)
+    print(f"🔍 Normalizing {len(raw_requirements)} package name(s) from requirements.txt...")
+    requirements = {}
+    name_mappings = []
+
+    for idx, (package_name, versions) in enumerate(raw_requirements, 1):
+        # Show progress for large requirements files
+        if len(raw_requirements) > 10:
+            print(f"   [{idx}/{len(raw_requirements)}] Resolving '{package_name}'...")
+
+        # Normalize package name to canonical PyPI name by querying PyPI
+        canonical_name = _resolve_requirements_package_name(package_name)
+        if canonical_name != package_name:
+            name_mappings.append((package_name, canonical_name))
+        requirements[canonical_name] = versions
+
+    # Report any package name normalizations
+    if name_mappings:
+        print(f"\n🗺️ Normalized {len(name_mappings)} package name(s):")
+        for original, canonical in name_mappings:
+            print(f"   • '{original}' → '{canonical}'")
 
     return requirements
 
@@ -609,9 +922,41 @@ def interactive_dockerfile_generation_optimized(resolved_packages, project_path=
 # 🚀 Main Execution Flow
 # =====================================================================
 def main():
+    global PYPI_IMPORT_MAPPING
+
     print("="*50)
     print("🧠 LLM-Driven Dependency Resolver")
     print("="*50)
+
+    # Load PyPI import mapping at startup
+    print("\n" + "="*50)
+    print("🗺️ Loading PyPI Import Mapping")
+    print("="*50)
+
+    # Try to find pypi_import_mapping.json in current directory or MockVenv directory
+    mapping_file_candidates = [
+        "pypi_import_mapping.json",
+        os.path.join(os.path.dirname(__file__), "pypi_import_mapping.json"),
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "pypi_import_mapping.json")
+    ]
+
+    mapping_file_path = None
+    for candidate in mapping_file_candidates:
+        if os.path.exists(candidate):
+            mapping_file_path = candidate
+            break
+
+    if mapping_file_path:
+        PYPI_IMPORT_MAPPING = load_pypi_import_mapping(mapping_file_path)
+        if PYPI_IMPORT_MAPPING:
+            print(f"✅ Successfully loaded {len(PYPI_IMPORT_MAPPING)} package mappings from {mapping_file_path}")
+        else:
+            print(f"⚠️ Warning: No mappings loaded from {mapping_file_path}")
+    else:
+        print(f"⚠️ Warning: pypi_import_mapping.json not found in expected locations:")
+        for candidate in mapping_file_candidates:
+            print(f"   - {candidate}")
+        print("   Continuing without package name mappings...")
 
     # Parse command line arguments
     if len(sys.argv) < 2:
@@ -755,7 +1100,8 @@ def main():
                 req_versions = requirements.get(package_name)
 
                 # Fetch all versions from PyPI
-                all_versions = get_pypi_versions(package_name)
+                # Note: package_name is already normalized to canonical PyPI name by load_requirements_txt
+                all_versions = get_pypi_versions(package_name, resolve_name=False)
 
                 if all_versions:
                     # If requirements.txt specifies versions, use those; otherwise use all
@@ -799,7 +1145,7 @@ def main():
             features = info.get("api_features", {})
 
             # Get version constraints from requirements.txt if available
-            pypi_name = PYPI_NAME_MAP.get(pkg, pkg)
+            pypi_name = _resolve_pypi_name_from_import(pkg)
             req_versions = None
             if pypi_name in requirements:
                 req_versions = requirements[pypi_name]

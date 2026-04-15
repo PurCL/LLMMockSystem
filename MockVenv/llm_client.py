@@ -121,7 +121,9 @@ def infer_versions(prompt: str) -> list:
     sys_prompt = (
         "SYSTEM: [STRICT_JSON_ONLY_MODE]\n"
         "You are a machine-to-machine API. YOU MUST NOT WRITE ANY EXPLANATORY TEXT.\n"
-        "Output ONLY a single JSON array of strings representing compatible versions. "
+        "Output ONLY a single JSON array of strings representing ALL compatible versions. "
+        "Your goal is to return a BROAD VERSION RANGE, not just one or two versions. "
+        "Include ALL versions that support the observed API patterns. "
         "Do NOT wrap it in markdown blockquotes (like ```json)."
     )
 
@@ -232,4 +234,76 @@ Output as JSON with keys "dockerfile" and "readme_section".
         return {
             "dockerfile": f"FROM {base_image}\nWORKDIR /app\n# Error generating content\n",
             "readme_section": "# Configuration failed to generate\n"
+        }
+
+
+# =====================================================================
+# 🚀 Business Logic 4: API Pattern Analysis (For resolve_dependencies.py)
+# =====================================================================
+def analyze_api_patterns(prompt: str) -> dict:
+    """
+    Use LLM to analyze API patterns and provide version constraint hints.
+
+    This is a general-purpose analyzer that works for any package by leveraging
+    LLM's knowledge of package version histories and API evolution patterns.
+
+    Args:
+        prompt: The analysis prompt containing package info and API signatures
+
+    Returns:
+        dict with keys:
+            - 'detected_patterns': list of pattern strings
+            - 'version_constraints': suggested constraint or None
+            - 'confidence': 'high', 'medium', or 'low'
+            - 'reasoning': explanation string
+    """
+    sys_prompt = (
+        "SYSTEM: [STRICT_JSON_ONLY_MODE]\n"
+        "You are a machine-to-machine API. YOU MUST NOT WRITE ANY EXPLANATORY TEXT.\n"
+        "Output ONLY a single JSON object with the following structure:\n"
+        "{\n"
+        '  "detected_patterns": ["list of patterns"],\n'
+        '  "version_constraints": "constraint string or null",\n'
+        '  "confidence": "high/medium/low",\n'
+        '  "reasoning": "explanation"\n'
+        "}\n"
+        "Do NOT wrap it in markdown blockquotes (like ```json)."
+    )
+
+    try:
+        raw_response = _run_sync(_ask_claude, prompt, sys_prompt)
+
+        # Clean and parse the JSON response
+        clean_value = raw_response.strip()
+        clean_value = re.sub(r'^```json\s*', '', clean_value)
+        clean_value = re.sub(r'^```\s*', '', clean_value)
+        clean_value = re.sub(r'\s*```$', '', clean_value)
+        match = re.search(r'\{.*\}', clean_value, re.DOTALL)
+        res_str = match.group(0) if match else clean_value
+
+        result = json.loads(res_str)
+
+        # Validate the response structure
+        required_keys = ['detected_patterns', 'version_constraints', 'confidence', 'reasoning']
+        if not isinstance(result, dict) or not all(key in result for key in required_keys):
+            raise ValueError("LLM response missing required keys")
+
+        # Ensure detected_patterns is a list
+        if not isinstance(result['detected_patterns'], list):
+            result['detected_patterns'] = []
+
+        # Normalize confidence to lowercase
+        if isinstance(result['confidence'], str):
+            result['confidence'] = result['confidence'].lower()
+
+        return result
+
+    except Exception as e:
+        print(f"   ❌ [LLM Error] Failed to analyze API patterns: {e}")
+        # Fallback: return low confidence result
+        return {
+            "detected_patterns": [],
+            "version_constraints": None,
+            "confidence": "low",
+            "reasoning": f"Analysis failed: {e}"
         }

@@ -8,7 +8,7 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-BACKEND_DIR="$HOME/data3/LLMMockSystem/test_example1/project/src/backend"
+BACKEND_DIR="${PWD}/project/src/backend"
 PORT_FILE="/tmp/llm_mock_server_port.txt"
 DB_ENV_FILE="/tmp/llm_mock_db_env.sh"
 

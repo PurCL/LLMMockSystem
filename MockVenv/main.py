@@ -219,7 +219,7 @@ Examples:
         "--mode",
         type=str,
         choices=['mock', 'real'],
-        default='mock',
+        required=True,
         help="Environment mode: 'mock' (default) for mock environment with Claude SDK, 'real' for real environment with exact package versions"
     )
 
