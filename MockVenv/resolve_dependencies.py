@@ -5,6 +5,8 @@ import urllib.request
 import itertools
 import llm_client
 import shutil
+import multiprocessing
+from functools import partial
 
 # =====================================================================
 # ⚙️ Configuration
@@ -582,6 +584,115 @@ def load_requirements_txt(requirements_path):
     return requirements
 
 
+def _process_package_with_api(args):
+    """
+    Worker function to process a single package with API signatures.
+    Used for parallel processing.
+
+    Args:
+        args: tuple of (idx, total, import_name, api_signatures, pypi_import_mapping, requirements_packages, requirements)
+
+    Returns:
+        tuple: (matched_req_pkg, versions, error_msg) or None if package not in requirements
+    """
+    idx, total, import_name, api_signatures, pypi_import_mapping, requirements_packages, requirements = args
+
+    try:
+        # Resolve import name to PyPI package name using the mapping
+        pypi_name = resolve_import_to_pypi_name(import_name, pypi_import_mapping)
+
+        print(f"\n[{idx}/{total}] Processing import: {import_name}")
+        if pypi_name != import_name:
+            print(f"   🗺️ Resolved to PyPI package: {pypi_name}")
+        print(f"   📝 Total API calls: {len(api_signatures)}")
+
+        # Check if this PyPI package is in requirements.txt
+        matched_req_pkg = None
+        for req_pkg in requirements_packages:
+            if (req_pkg.lower().replace('-', '_') == pypi_name.lower().replace('-', '_') or
+                req_pkg.lower().replace('_', '-') == pypi_name.lower().replace('_', '-')):
+                matched_req_pkg = req_pkg
+                break
+
+        if not matched_req_pkg:
+            print(f"   ⚠️ Package '{pypi_name}' not found in requirements.txt, skipping")
+            return None
+
+        print(f"   ✅ Matched to requirements.txt package: {matched_req_pkg}")
+
+        # Get version constraints from requirements.txt if available
+        req_versions = requirements.get(matched_req_pkg)
+        if req_versions:
+            print(f"   📋 Constrained by requirements.txt: {req_versions}")
+        else:
+            print(f"   📋 In requirements.txt (all versions allowed)")
+
+        # Infer compatible versions based on API signatures
+        versions = infer_versions_from_llm(import_name, api_signatures, req_versions)
+
+        if versions:
+            print(f"   ✅ Result: {len(versions)} compatible versions found")
+            print(f"   📌 Top versions: {versions[:5]}")
+            return (matched_req_pkg, versions, None)
+        else:
+            print(f"   ⚠️ Result: No compatible versions found")
+            return (matched_req_pkg, [], None)
+
+    except Exception as e:
+        error_msg = f"Error processing {import_name}: {str(e)}"
+        print(f"   ❌ {error_msg}")
+        return (import_name, [], error_msg)
+
+
+def _process_package_without_api(args):
+    """
+    Worker function to process a single package without API signatures.
+    Used for parallel processing.
+
+    Args:
+        args: tuple of (idx, total, package_name, requirements)
+
+    Returns:
+        tuple: (package_name, versions, error_msg)
+    """
+    idx, total, package_name, requirements = args
+
+    try:
+        print(f"\n[{idx}/{total}] Processing package: {package_name}")
+
+        # Get version constraints from requirements.txt
+        req_versions = requirements.get(package_name)
+
+        # Fetch all versions from PyPI
+        all_versions = get_pypi_versions(package_name, resolve_name=False)
+
+        if all_versions:
+            # If requirements.txt specifies versions, use those; otherwise use all
+            if req_versions:
+                filtered_versions = [v for v in all_versions if v in req_versions]
+                if filtered_versions:
+                    print(f"   ✅ {len(filtered_versions)} versions from requirements.txt")
+                    print(f"   📌 Versions: {filtered_versions}")
+                    return (package_name, filtered_versions, None)
+                else:
+                    # Fall back to all versions if constraints don't match
+                    print(f"   ⚠️ No matching versions, using all {len(all_versions)} versions")
+                    print(f"   📌 Top versions: {all_versions[:5]}")
+                    return (package_name, all_versions, None)
+            else:
+                print(f"   ✅ All {len(all_versions)} versions allowed (no API constraints)")
+                print(f"   📌 Top versions: {all_versions[:5]}")
+                return (package_name, all_versions, None)
+        else:
+            print(f"   ⚠️ No versions found on PyPI for package: {package_name}")
+            return (package_name, [], None)
+
+    except Exception as e:
+        error_msg = f"Error processing {package_name}: {str(e)}"
+        print(f"   ❌ {error_msg}")
+        return (package_name, [], error_msg)
+
+
 def generate_package_combinations(resolved_packages):
     """
     Generate all possible combinations of package versions.
@@ -1036,51 +1147,37 @@ def main():
         # Track which requirements packages have been matched
         matched_requirements_packages = set()
 
-        # Process each package from API logs
+        # Process each package from API logs with parallel processing
         print("\n" + "="*50)
         print("📦 STEP 3: Analyzing API signatures to infer compatible versions")
         print("="*50)
-        for idx, (import_name, api_signatures) in enumerate(api_by_package.items(), 1):
-            # Resolve import name to PyPI package name using the mapping
-            pypi_name = resolve_import_to_pypi_name(import_name, pypi_import_mapping)
 
-            print(f"\n[{idx}/{len(api_by_package)}] Processing import: {import_name}")
-            if pypi_name != import_name:
-                print(f"   🗺️ Resolved to PyPI package: {pypi_name}")
-            print(f"   📝 Total API calls: {len(api_signatures)}")
+        # Calculate number of processes to use: min(32, cpu_count())
+        num_processes = min(32, multiprocessing.cpu_count())
+        print(f"🚀 Using {num_processes} parallel processes for package inference")
 
-            # Check if this PyPI package is in requirements.txt
-            # Need to check both the resolved name and normalized versions
-            matched_req_pkg = None
-            for req_pkg in requirements_packages:
-                if (req_pkg.lower().replace('-', '_') == pypi_name.lower().replace('-', '_') or
-                    req_pkg.lower().replace('_', '-') == pypi_name.lower().replace('_', '-')):
-                    matched_req_pkg = req_pkg
-                    matched_requirements_packages.add(req_pkg)
-                    break
+        # Prepare arguments for parallel processing
+        api_package_items = list(api_by_package.items())
+        total_packages = len(api_package_items)
 
-            if not matched_req_pkg:
-                print(f"   ⚠️ Package '{pypi_name}' not found in requirements.txt, skipping")
-                continue
+        process_args = [
+            (idx, total_packages, import_name, api_signatures, pypi_import_mapping, requirements_packages, requirements)
+            for idx, (import_name, api_signatures) in enumerate(api_package_items, 1)
+        ]
 
-            print(f"   ✅ Matched to requirements.txt package: {matched_req_pkg}")
+        # Process packages in parallel
+        with multiprocessing.Pool(processes=num_processes) as pool:
+            results = pool.map(_process_package_with_api, process_args)
 
-            # Get version constraints from requirements.txt if available
-            req_versions = requirements.get(matched_req_pkg)
-            if req_versions:
-                print(f"   📋 Constrained by requirements.txt: {req_versions}")
-            else:
-                print(f"   📋 In requirements.txt (all versions allowed)")
-
-            # Infer compatible versions based on API signatures
-            versions = infer_versions_from_llm(import_name, api_signatures, req_versions)
-
-            if versions:
-                resolved_packages[matched_req_pkg] = versions
-                print(f"   ✅ Result: {len(versions)} compatible versions found")
-                print(f"   📌 Top versions: {versions[:5]}")
-            else:
-                print(f"   ⚠️ Result: No compatible versions found")
+        # Collect results
+        for result in results:
+            if result is not None:
+                matched_req_pkg, versions, error_msg = result
+                if error_msg:
+                    print(f"   ⚠️ Warning: {error_msg}")
+                elif versions:
+                    resolved_packages[matched_req_pkg] = versions
+                    matched_requirements_packages.add(matched_req_pkg)
 
         # For packages in requirements.txt without API logs, add all versions
         print("\n" + "="*50)
@@ -1093,35 +1190,27 @@ def main():
             for pkg in sorted(packages_without_api):
                 print(f"   • {pkg}")
 
-            for idx, package_name in enumerate(sorted(packages_without_api), 1):
-                print(f"\n[{idx}/{len(packages_without_api)}] Processing package: {package_name}")
+            # Prepare arguments for parallel processing
+            packages_list = sorted(packages_without_api)
+            total_without_api = len(packages_list)
 
-                # Get version constraints from requirements.txt
-                req_versions = requirements.get(package_name)
+            process_args = [
+                (idx, total_without_api, package_name, requirements)
+                for idx, package_name in enumerate(packages_list, 1)
+            ]
 
-                # Fetch all versions from PyPI
-                # Note: package_name is already normalized to canonical PyPI name by load_requirements_txt
-                all_versions = get_pypi_versions(package_name, resolve_name=False)
+            # Process packages in parallel
+            print(f"🚀 Using {num_processes} parallel processes for package fetching")
+            with multiprocessing.Pool(processes=num_processes) as pool:
+                results = pool.map(_process_package_without_api, process_args)
 
-                if all_versions:
-                    # If requirements.txt specifies versions, use those; otherwise use all
-                    if req_versions:
-                        filtered_versions = [v for v in all_versions if v in req_versions]
-                        if filtered_versions:
-                            resolved_packages[package_name] = filtered_versions
-                            print(f"   ✅ {len(filtered_versions)} versions from requirements.txt")
-                            print(f"   📌 Versions: {filtered_versions}")
-                        else:
-                            # Fall back to all versions if constraints don't match
-                            resolved_packages[package_name] = all_versions
-                            print(f"   ⚠️ No matching versions, using all {len(all_versions)} versions")
-                            print(f"   📌 Top versions: {all_versions[:5]}")
-                    else:
-                        resolved_packages[package_name] = all_versions
-                        print(f"   ✅ All {len(all_versions)} versions allowed (no API constraints)")
-                        print(f"   📌 Top versions: {all_versions[:5]}")
-                else:
-                    print(f"   ⚠️ No versions found on PyPI for package: {package_name}")
+            # Collect results
+            for result in results:
+                package_name, versions, error_msg = result
+                if error_msg:
+                    print(f"   ⚠️ Warning: {error_msg}")
+                elif versions:
+                    resolved_packages[package_name] = versions
         else:
             print("✅ All packages in requirements.txt have API logs")
 
