@@ -2,3 +2,5 @@ __pycache__
 resolved_versions.json
 .venv
 generated_dockerfiles
+testscript/*
+fixed_requirements.txt

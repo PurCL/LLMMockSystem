@@ -202,7 +202,7 @@ def get_pypi_versions(package_name, resolve_name=True, return_canonical_name=Fal
         return []
 
 
-def analyze_api_signatures_for_hints(package_name, api_signatures, all_versions):
+def analyze_api_signatures_for_hints(package_name, api_signatures, all_versions, testscript_dir=None):
     """
     Use LLM to analyze API signatures and provide intelligent version hints.
 
@@ -213,6 +213,7 @@ def analyze_api_signatures_for_hints(package_name, api_signatures, all_versions)
         package_name: Name of the package
         api_signatures: List of API call signatures
         all_versions: List of all available versions from PyPI
+        testscript_dir: Optional directory for test scripts
 
     Returns:
         dict with LLM-generated analysis results
@@ -273,7 +274,7 @@ Your response (JSON only):"""
     try:
         # Use LLM to analyze the patterns
         print(f"   🧠 [Pattern Analyzer] Asking LLM to analyze API patterns for {pypi_name}...")
-        result = llm_client.analyze_api_patterns(prompt)
+        result = llm_client.analyze_api_patterns(prompt, testscript_dir=testscript_dir)
 
         if result and isinstance(result, dict):
             print(f"   💡 [Pattern Analyzer] Confidence: {result.get('confidence', 'unknown')}")
@@ -354,7 +355,7 @@ def parse_api_calls_from_text(api_calls_text):
     return api_by_package
 
 
-def infer_versions_from_llm(package_name, api_signatures, requirements_versions=None):
+def infer_versions_from_llm(package_name, api_signatures, requirements_versions=None, testscript_dir=None):
     """
     Call the abstracted LLM Client to deduce an array of compatible versions
     based on the observed API signatures.
@@ -363,6 +364,7 @@ def infer_versions_from_llm(package_name, api_signatures, requirements_versions=
         package_name: Name of the package
         api_signatures: List of API call signatures (e.g., ["semver.VersionInfo()", ...])
         requirements_versions: Optional list of versions from requirements.txt to constrain search
+        testscript_dir: Optional directory for test scripts
     """
     pypi_name = _resolve_pypi_name_from_import(package_name)
     # Get all versions including pre-releases initially for better debugging
@@ -421,7 +423,7 @@ def infer_versions_from_llm(package_name, api_signatures, requirements_versions=
     print(f"   📊 Analyzing {len(api_signatures)} API calls against {len(all_versions)} versions")
 
     # Analyze signatures for version hints using LLM
-    hints = analyze_api_signatures_for_hints(package_name, api_signatures, all_versions)
+    hints = analyze_api_signatures_for_hints(package_name, api_signatures, all_versions, testscript_dir=testscript_dir)
     if hints["confidence"] in ["high", "medium"]:
         print(f"   🔍 Detected patterns: {', '.join(hints['detected_patterns'])}")
         if hints.get('version_constraints'):
@@ -501,7 +503,7 @@ Example: ["2.1.0", "2.0.9", "2.0.8", "2.0.7", "2.0.6", "2.0.5", "2.0.4"]
 Your response (JSON array only):"""
 
     # 💡 Elegant one-line call to our LLM service hub
-    valid_versions = llm_client.infer_versions(prompt)
+    valid_versions = llm_client.infer_versions(prompt, testscript_dir=testscript_dir)
 
     if valid_versions:
         print(f"   ✅ [LLM Insight] Constrained from {len(all_versions)} down to {len(valid_versions)} compatible versions.")
@@ -590,12 +592,12 @@ def _process_package_with_api(args):
     Used for parallel processing.
 
     Args:
-        args: tuple of (idx, total, import_name, api_signatures, pypi_import_mapping, requirements_packages, requirements)
+        args: tuple of (idx, total, import_name, api_signatures, pypi_import_mapping, requirements_packages, requirements, testscript_dir)
 
     Returns:
         tuple: (matched_req_pkg, versions, error_msg) or None if package not in requirements
     """
-    idx, total, import_name, api_signatures, pypi_import_mapping, requirements_packages, requirements = args
+    idx, total, import_name, api_signatures, pypi_import_mapping, requirements_packages, requirements, testscript_dir = args
 
     try:
         # Resolve import name to PyPI package name using the mapping
@@ -628,7 +630,7 @@ def _process_package_with_api(args):
             print(f"   📋 In requirements.txt (all versions allowed)")
 
         # Infer compatible versions based on API signatures
-        versions = infer_versions_from_llm(import_name, api_signatures, req_versions)
+        versions = infer_versions_from_llm(import_name, api_signatures, req_versions, testscript_dir=testscript_dir)
 
         if versions:
             print(f"   ✅ Result: {len(versions)} compatible versions found")
@@ -1103,19 +1105,13 @@ def main():
     # Dictionary to store the resolved configuration
     resolved_packages = {}
 
-    if mode == 'real':
-        # Load pypi_import_mapping.json first
-        print("\n" + "="*50)
-        print("🗺️ STEP 0: Loading PyPI import mapping")
-        print("="*50)
-        # Try to find pypi_import_mapping.json in current directory or MockVenv directory
-        mapping_file_path = "pypi_import_mapping.json"
-        pypi_import_mapping = {}
-        if os.path.exists(mapping_file_path):
-            pypi_import_mapping = load_pypi_import_mapping(mapping_file_path)
-        else:
-            raise FileNotFoundError(f"⚠️ pypi_import_mapping.json not found in expected paths: {mapping_file_path}")
+    # Create testscript directory for Claude Code to write test scripts (in resolve mode)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    testscript_dir = os.path.join(script_dir, "testscript")
+    os.makedirs(testscript_dir, exist_ok=True)
+    print(f"📁 Test script directory: {testscript_dir}")
 
+    if mode == 'real':
         # Read requirements.txt and store all package names
         print("\n" + "="*50)
         print("📋 STEP 1: Reading requirements.txt and storing all package names")
@@ -1161,7 +1157,7 @@ def main():
         total_packages = len(api_package_items)
 
         process_args = [
-            (idx, total_packages, import_name, api_signatures, pypi_import_mapping, requirements_packages, requirements)
+            (idx, total_packages, import_name, api_signatures, pypi_import_mapping, requirements_packages, requirements, testscript_dir)
             for idx, (import_name, api_signatures) in enumerate(api_package_items, 1)
         ]
 
@@ -1245,7 +1241,7 @@ def main():
                 for api_name, api_info in features.items():
                     api_signatures.append(f"{pkg}.{api_name}()")
 
-            versions = infer_versions_from_llm(pkg, api_signatures, req_versions)
+            versions = infer_versions_from_llm(pkg, api_signatures, req_versions, testscript_dir=testscript_dir)
 
             if versions:
                 resolved_packages[pypi_name] = versions
@@ -1295,6 +1291,64 @@ def main():
     # Generate combinations on-demand during dockerfile generation
     # This avoids memory issues with large combination sets
     interactive_dockerfile_generation_optimized(resolved_packages, project_path=project_path, use_llm=use_llm)
+
+    # =================================================================
+    # 🧹 Cleanup: Remove test scripts and documentation from testscript directory
+    # =================================================================
+    print("\n" + "="*50)
+    print("🧹 STEP 6: Cleanup testscript directory")
+    print("="*50)
+
+    if os.path.exists(testscript_dir):
+        # Patterns to match files that should be removed
+        cleanup_patterns = [
+            '**/*test*.py',         # Test files
+            '**/*demo*.py',         # Demo files
+            '**/*example*.py',      # Example files
+            '**/*.md',              # Markdown documentation
+            '**/*.txt',             # Text documentation
+            '**/*.rst',             # ReStructuredText documentation
+            '**/README*',           # README files
+            '**/CHANGELOG*',        # Changelog files
+            '**/LICENSE*',          # License files
+            '**/docs/**/*',         # Documentation directories
+        ]
+
+        import glob
+        removed_files = []
+
+        for pattern in cleanup_patterns:
+            full_pattern = os.path.join(testscript_dir, pattern)
+            for file_path in glob.glob(full_pattern, recursive=True):
+                # Skip if it's a directory
+                if os.path.isdir(file_path):
+                    continue
+
+                try:
+                    os.remove(file_path)
+                    removed_files.append(os.path.relpath(file_path, testscript_dir))
+                    print(f"   🗑️ Removed: {os.path.relpath(file_path, testscript_dir)}")
+                except Exception as e:
+                    print(f"   ⚠️ Failed to remove {file_path}: {e}")
+
+        if removed_files:
+            print(f"\n✅ Cleaned up {len(removed_files)} file(s) from testscript directory")
+        else:
+            print(f"\n✅ No cleanup needed in testscript directory")
+
+        # Remove empty directories
+        try:
+            for root, dirs, files in os.walk(testscript_dir, topdown=False):
+                for dir_name in dirs:
+                    dir_path = os.path.join(root, dir_name)
+                    try:
+                        if not os.listdir(dir_path):  # Check if directory is empty
+                            os.rmdir(dir_path)
+                            print(f"   🗑️ Removed empty directory: {os.path.relpath(dir_path, testscript_dir)}")
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"   ⚠️ Warning during directory cleanup: {e}")
 
 
 if __name__ == "__main__":

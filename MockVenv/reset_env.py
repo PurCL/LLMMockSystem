@@ -12,6 +12,7 @@ os.environ["UV_LINK_MODE"] = "copy"
 def main():
     req_file = sys.argv[1] if len(sys.argv) > 1 else None
     mode = sys.argv[2] if len(sys.argv) > 2 else 'mock'
+    python_version = sys.argv[3] if len(sys.argv) > 3 else None
 
     # Convert req_file to absolute path before saving to environment variable
     if req_file:
@@ -22,7 +23,13 @@ def main():
     shutil.rmtree(".venv", ignore_errors=True)
 
     print(f"🌱 2. Rebuilding the virtual environment at lightning speed using uv...")
-    subprocess.run(["uv", "venv", ".venv"], check=True)
+    # Build uv venv command with optional --python argument
+    uv_cmd = ["uv", "venv"]
+    if python_version:
+        uv_cmd.extend(["--python", python_version])
+        print(f"   🐍 Using Python version: {python_version}")
+    uv_cmd.append(".venv")
+    subprocess.run(uv_cmd, check=True)
 
     print(f"🎯 Mode: {mode.upper()}")
 

@@ -47,7 +47,7 @@ def _run_sync(async_func, *args, **kwargs):
 # =====================================================================
 # 🛠️ Base LLM Communication Channel
 # =====================================================================
-async def _ask_claude(prompt: str, system_prompt: str, disable_write: bool = False) -> str:
+async def _ask_claude(prompt: str, system_prompt: str, disable_write: bool = False, cwd: str = None) -> str:
     """
     Base async function to communicate with Claude.
 
@@ -55,6 +55,7 @@ async def _ask_claude(prompt: str, system_prompt: str, disable_write: bool = Fal
         prompt: The user prompt/query
         system_prompt: System instructions for Claude
         disable_write: If True, disables Write and other file creation tools
+        cwd: Optional working directory for Claude Code (default: current directory)
 
     Returns:
         The final text response from Claude
@@ -68,13 +69,16 @@ async def _ask_claude(prompt: str, system_prompt: str, disable_write: bool = Fal
     if prompt_size > 500000:  # 500KB limit for safety
         raise Exception(f"Prompt too large: {prompt_size} bytes (max 500KB). Please reduce trace file or project files size.")
 
+    # Use provided cwd or default to current directory
+    working_dir = cwd if cwd else os.getcwd()
+
     # Base configuration
     options_dict = {
         'model': 'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
         'system_prompt': system_prompt,
         'allowed_tools': [],
         'permission_mode': 'acceptEdits',
-        'cwd': os.getcwd(),
+        'cwd': working_dir,
         'max_turns': 3
     }
 
@@ -137,18 +141,22 @@ def API_feature(traceback_text: str, recent_calls: list = None) -> dict:
 # =====================================================================
 # 🚀 Business Logic 2: Dependency Version Inference (For generate_dockerfiles.py)
 # =====================================================================
-def infer_versions(prompt: str) -> list:
+def infer_versions(prompt: str, testscript_dir: str = None) -> list:
     sys_prompt = (
         "SYSTEM: [STRICT_JSON_ONLY_MODE]\n"
         "You are a machine-to-machine API. YOU MUST NOT WRITE ANY EXPLANATORY TEXT.\n"
         "Output ONLY a single JSON array of strings representing ALL compatible versions. "
         "Your goal is to return a BROAD VERSION RANGE, not just one or two versions. "
         "Include ALL versions that support the observed API patterns. "
-        "Do NOT wrap it in markdown blockquotes (like ```json)."
+        "Do NOT wrap it in markdown blockquotes (like ```json).\n\n"
+        "IMPORTANT: If you need to generate test scripts or demo files to verify version compatibility, "
+        "you MAY write them to the current working directory (testscript/). "
+        "However, you MUST still return the JSON array in your final response. "
+        "Do NOT generate documentation files (README.md, docs, etc.) or Dockerfiles."
     )
 
     try:
-        raw_response = _run_sync(_ask_claude, prompt, sys_prompt)
+        raw_response = _run_sync(_ask_claude, prompt, sys_prompt, cwd=testscript_dir)
 
         # Clean and parse the JSON array response
         clean_value = raw_response.strip()
@@ -260,7 +268,7 @@ Output as JSON with keys "dockerfile" and "readme_section".
 # =====================================================================
 # 🚀 Business Logic 4: API Pattern Analysis (For resolve_dependencies.py)
 # =====================================================================
-def analyze_api_patterns(prompt: str) -> dict:
+def analyze_api_patterns(prompt: str, testscript_dir: str = None) -> dict:
     """
     Use LLM to analyze API patterns and provide version constraint hints.
 
@@ -269,6 +277,7 @@ def analyze_api_patterns(prompt: str) -> dict:
 
     Args:
         prompt: The analysis prompt containing package info and API signatures
+        testscript_dir: Optional directory for test scripts (if Claude Code needs to write files)
 
     Returns:
         dict with keys:
@@ -287,11 +296,15 @@ def analyze_api_patterns(prompt: str) -> dict:
         '  "confidence": "high/medium/low",\n'
         '  "reasoning": "explanation"\n'
         "}\n"
-        "Do NOT wrap it in markdown blockquotes (like ```json)."
+        "Do NOT wrap it in markdown blockquotes (like ```json).\n\n"
+        "IMPORTANT: If you need to generate test scripts or demo files to verify API patterns, "
+        "you MAY write them to the current working directory (testscript/). "
+        "However, you MUST still return the JSON object in your final response. "
+        "Do NOT generate documentation files (README.md, docs, etc.) or Dockerfiles."
     )
 
     try:
-        raw_response = _run_sync(_ask_claude, prompt, sys_prompt)
+        raw_response = _run_sync(_ask_claude, prompt, sys_prompt, cwd=testscript_dir)
 
         # Clean and parse the JSON response
         clean_value = raw_response.strip()

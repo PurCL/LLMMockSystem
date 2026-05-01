@@ -22,13 +22,14 @@ import json
 import re
 
 
-def reset_environment(requirements_path, mode='mock'):
+def reset_environment(requirements_path, mode='mock', python_version=None):
     """
     Create a virtual environment based on the provided requirements.txt file.
 
     Args:
         requirements_path: Path to the requirements.txt file
         mode: Environment mode - 'mock' (default) or 'real'
+        python_version: Optional Python version to use (e.g., '3.10', '3.11')
 
     This function calls reset_env.py to:
     - Destroy the old .venv environment
@@ -52,6 +53,8 @@ def reset_environment(requirements_path, mode='mock'):
     print(f"📋 Using requirements file: {requirements_path}")
     print(f"📂 Target directory: {os.getcwd()}")
     print(f"🎯 Mode: {mode}")
+    if python_version:
+        print(f"🐍 Python version: {python_version}")
 
     # Get the directory where this script is located
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -61,9 +64,13 @@ def reset_environment(requirements_path, mode='mock'):
         print(f"❌ Error: reset_env.py not found at: {reset_script}")
         sys.exit(1)
 
-    # Execute reset_env.py with the requirements file path and mode as arguments
+    # Execute reset_env.py with the requirements file path, mode, and optional python version
+    cmd = [sys.executable, reset_script, requirements_path, mode]
+    if python_version:
+        cmd.append(python_version)
+
     try:
-        subprocess.run([sys.executable, reset_script, requirements_path, mode], check=True)
+        subprocess.run(cmd, check=True)
         print("\n✅ Environment reset completed successfully!")
     except subprocess.CalledProcessError as e:
         print(f"\n❌ Error during environment reset: {e}")
@@ -682,6 +689,9 @@ Examples:
   # Reset environment in real mode (exact versions from requirements.txt)
   python main.py --reset --mode real --requirements /path/to/requirements.txt
 
+  # Reset environment with a specific Python version
+  python main.py --reset --mode mock --requirements /path/to/requirements.txt --python 3.10
+
   # Fix mode: Analyze exploit failures and identify package version issues
   python main.py --fix --requirements /path/to/requirements.txt --project /path/to/project --exploit /path/to/exploit1.sh,/path/to/exploit2.sh
 
@@ -723,6 +733,13 @@ Examples:
         type=str,
         metavar="REQUIREMENTS_FILE",
         help="Path to requirements.txt file (required for --reset and --fix, optional for --resolve)"
+    )
+
+    parser.add_argument(
+        "--python",
+        type=str,
+        metavar="PYTHON_VERSION",
+        help="Python version to use for the virtual environment (e.g., '3.10', '3.11', 'python3.10')"
     )
 
     parser.add_argument(
@@ -793,7 +810,7 @@ Examples:
             parser.error("--reset requires the --mode argument (mock or real).")
         if not args.requirements:
             parser.error("--reset requires the --requirements argument to specify the requirements file.")
-        reset_environment(args.requirements, mode=args.mode)
+        reset_environment(args.requirements, mode=args.mode, python_version=args.python)
     elif args.resolve:
         if not args.mode:
             parser.error("--resolve requires the --mode argument (mock or real).")
