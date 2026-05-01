@@ -1,0 +1,10 @@
+services:
+  target:
+    build: ./target
+    ports:
+      - "9090:9090"
+
+  evaluator:
+    build: ./evaluator
+    ports:
+      - "9091:9091"

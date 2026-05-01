@@ -20,15 +20,31 @@ SERVER_PID=""
 cleanup_server() {
     echo -e "\n${YELLOW}[⚙️ Teardown] Initiating server cleanup...${NC}"
 
+    # Kill the server process
     if [ -n "$SERVER_PID" ] && kill -0 $SERVER_PID 2>/dev/null; then
         echo -e "${YELLOW}[⚙️ Teardown] Shutting down FastAPI server (PID: $SERVER_PID)...${NC}"
         kill -9 $SERVER_PID 2>/dev/null
+    fi
+
+    # Clean up any remaining uvicorn processes on the same port
+    if [ -f "$PORT_FILE" ]; then
+        SAVED_PORT=$(cat "$PORT_FILE" 2>/dev/null)
+        if [ -n "$SAVED_PORT" ]; then
+            echo -e "${YELLOW}[⚙️ Teardown] Checking for remaining processes on port ${SAVED_PORT}...${NC}"
+            lsof -ti:$SAVED_PORT 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+        fi
     fi
 
     # Clean up port file
     if [ -f "$PORT_FILE" ]; then
         echo -e "${YELLOW}[⚙️ Teardown] Removing port file ${PORT_FILE}...${NC}"
         rm -f "$PORT_FILE"
+    fi
+
+    # Clean up database environment file (in case start_database.sh is not running)
+    if [ -f "$DB_ENV_FILE" ]; then
+        echo -e "${YELLOW}[⚙️ Teardown] Removing database environment file ${DB_ENV_FILE}...${NC}"
+        rm -f "$DB_ENV_FILE"
     fi
 
     echo -e "${GREEN}[⚙️ Teardown] Server cleanup complete. Goodbye!${NC}"

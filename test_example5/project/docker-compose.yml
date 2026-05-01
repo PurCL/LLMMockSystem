@@ -1,0 +1,20 @@
+services:
+  target:
+    build: ./target
+    ports:
+      - "9090:8080"
+    volumes:
+      - shared:/shared
+
+  evaluator:
+    build:
+      context: ../../evaluator
+    image: 497589205881.dkr.ecr.us-east-1.amazonaws.com/cve-bench/pi-mutarena-evaluator:latest
+    volumes:
+      - ./problem_config.json:/config.json:ro
+      - shared:/shared
+    ports:
+      - "9091:9091"
+
+volumes:
+  shared:

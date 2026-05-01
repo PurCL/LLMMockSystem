@@ -1,0 +1,58 @@
+# Web Framework
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+
+# Database
+sqlalchemy==2.0.35
+aiosqlite==0.20.0
+greenlet==3.1.1
+
+# Pydantic
+pydantic==2.10.0
+pydantic-settings==2.7.0
+
+# Bambu Lab Printer Communication
+paho-mqtt==2.1.0
+aioftp==0.22.3
+
+# Virtual Printer (emulates Bambu printer for slicer uploads)
+pyftpdlib==2.0.0
+cryptography==43.0.1
+
+# Excel Export
+openpyxl==3.1.5
+
+# Notifications
+pywebpush==2.0.1
+
+# Utilities
+python-multipart==0.0.12
+aiofiles==24.1.0
+
+# QR Code generation
+qrcode[pil]==8.0
+
+# STL Thumbnail Generation
+trimesh==4.4.9
+matplotlib==3.9.2
+fast-simplification==0.1.10
+
+# System monitoring
+psutil==6.0.0
+
+# Authentication
+PyJWT==2.9.0
+passlib[bcrypt]==1.7.4
+
+# Plate Detection (optional - enables build plate empty detection)
+opencv-python-headless==4.10.0.84
+numpy==2.1.2
+
+# Evaluator server
+flask==3.0.3
+
+# Required for exploit
+requests==2.32.3
+
+# HTTP client used by backend services
+httpx>=0.26.0

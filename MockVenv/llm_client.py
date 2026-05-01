@@ -23,18 +23,21 @@ def _run_sync(async_func, *args, **kwargs):
             res = loop.run_until_complete(async_func(*args, **kwargs))
             result_container.append(("SUCCESS", res))
         except Exception as ex:
-            result_container.append(("ERROR", str(ex)))
+            # Capture full exception details for better debugging
+            import traceback
+            error_details = f"{str(ex)}\n\nFull traceback:\n{traceback.format_exc()}"
+            result_container.append(("ERROR", error_details))
         finally:
             try: loop.close()
             except: pass
 
     t = threading.Thread(target=_run_in_isolated_loop)
-    t.daemon = True 
+    t.daemon = True
     t.start()
-    
+
     while t.is_alive():
         t.join(0.1)
-        
+
     if result_container:
         status, value = result_container[0]
         if status == "SUCCESS": return value
@@ -56,6 +59,15 @@ async def _ask_claude(prompt: str, system_prompt: str, disable_write: bool = Fal
     Returns:
         The final text response from Claude
     """
+    # Check prompt size to avoid issues
+    prompt_size = len(prompt)
+    if prompt_size > 1000000:  # 1MB
+        print(f"⚠️  Warning: Prompt is very large ({prompt_size} bytes), this may cause issues")
+
+    # If prompt is too large, raise error early
+    if prompt_size > 500000:  # 500KB limit for safety
+        raise Exception(f"Prompt too large: {prompt_size} bytes (max 500KB). Please reduce trace file or project files size.")
+
     # Base configuration
     options_dict = {
         'model': 'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
@@ -78,9 +90,17 @@ async def _ask_claude(prompt: str, system_prompt: str, disable_write: bool = Fal
     options = ClaudeAgentOptions(**options_dict)
 
     final_result = ''
-    async for message in query(prompt=prompt, options=options):
-        if type(message).__name__ == "ResultMessage" and message.result:
-            final_result = message.result
+    try:
+        async for message in query(prompt=prompt, options=options):
+            if type(message).__name__ == "ResultMessage" and message.result:
+                final_result = message.result
+    except Exception as e:
+        # Provide more context about the error
+        error_msg = f"Claude Agent SDK error: {str(e)}\nPrompt size: {prompt_size} bytes"
+        # Try to extract more details from the exception
+        if hasattr(e, '__cause__') and e.__cause__:
+            error_msg += f"\nCause: {str(e.__cause__)}"
+        raise Exception(error_msg) from e
 
     return final_result
 
