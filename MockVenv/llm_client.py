@@ -340,3 +340,128 @@ def analyze_api_patterns(prompt: str, testscript_dir: str = None) -> dict:
             "confidence": "low",
             "reasoning": f"Analysis failed: {e}"
         }
+
+
+# =====================================================================
+# 🚀 Business Logic 5: LLM-Guided Version Selection Based on Docker Build Errors
+# =====================================================================
+def suggest_next_version_combination(
+    error_message: str,
+    failed_combinations: list,
+    available_versions: dict,
+    packages: list
+) -> dict:
+    """
+    Use LLM to analyze Docker build error and suggest the next version combination to try.
+
+    Args:
+        error_message: The Docker build error message
+        failed_combinations: List of previously failed combinations [{"pkg1": "ver1", ...}, ...]
+        available_versions: Dict of {package_name: [list of available versions]}
+        packages: List of package names to generate combination for
+
+    Returns:
+        dict with keys:
+            - 'combination': dict {package_name: version} - the suggested next combination
+            - 'reasoning': str - explanation of why this combination was chosen
+            - 'confidence': str - 'high', 'medium', or 'low'
+    """
+    sys_prompt = (
+        "SYSTEM: [STRICT_JSON_ONLY_MODE]\n"
+        "You are a Python package dependency expert. YOU MUST NOT WRITE ANY EXPLANATORY TEXT.\n"
+        "Output ONLY a single JSON object with the following structure:\n"
+        "{\n"
+        '  "combination": {"package1": "version1", "package2": "version2", ...},\n'
+        '  "reasoning": "explanation of why this combination should work",\n'
+        '  "confidence": "high/medium/low"\n'
+        "}\n"
+        "Do NOT wrap it in markdown blockquotes (like ```json).\n\n"
+        "CRITICAL RULES:\n"
+        "1. Start with the NEWEST compatible versions first (highest version numbers)\n"
+        "2. When a build fails, analyze the error to identify which package(s) caused the issue\n"
+        "3. Only downgrade the problematic package(s), keep others at their current versions\n"
+        "4. Never suggest a combination that has already been tried\n"
+        "5. Consider version compatibility constraints between packages\n"
+        "6. The combination MUST include ALL packages listed in the available_versions"
+    )
+
+    # Build the prompt
+    prompt = f"""Analyze this Docker build error and suggest the next package version combination to try.
+
+## Docker Build Error:
+```
+{error_message}
+```
+
+## Previously Failed Combinations:
+"""
+
+    for idx, combo in enumerate(failed_combinations, 1):
+        prompt += f"\nAttempt {idx}:\n"
+        for pkg, ver in combo.items():
+            prompt += f"  - {pkg}=={ver}\n"
+
+    prompt += "\n## Available Versions for Each Package:\n"
+    for pkg in packages:
+        versions = available_versions.get(pkg, [])
+        prompt += f"\n{pkg}:\n"
+        prompt += f"  Available versions (newest to oldest): {', '.join(versions[:10])}"
+        if len(versions) > 10:
+            prompt += f" ... ({len(versions)} total)"
+        prompt += "\n"
+
+    prompt += """
+
+## Your Task:
+1. Analyze the error message to identify which package version caused the failure
+2. Suggest the next version combination to try that:
+   - Has NOT been tried before
+   - Addresses the identified compatibility issue
+   - Uses the NEWEST possible versions while avoiding the problematic combination
+   - Includes ALL packages listed above
+
+Return your suggestion as a JSON object with the structure specified in the system prompt.
+"""
+
+    try:
+        raw_response = _run_sync(_ask_claude, prompt, sys_prompt, disable_write=True)
+
+        # Clean and parse the JSON response
+        clean_value = raw_response.strip()
+        clean_value = re.sub(r'^```json\s*', '', clean_value)
+        clean_value = re.sub(r'^```\s*', '', clean_value)
+        clean_value = re.sub(r'\s*```$', '', clean_value)
+        match = re.search(r'\{.*\}', clean_value, re.DOTALL)
+        res_str = match.group(0) if match else clean_value
+
+        result = json.loads(res_str)
+
+        # Validate the response structure
+        if not isinstance(result, dict) or 'combination' not in result:
+            raise ValueError("LLM response missing 'combination' key")
+
+        if not isinstance(result['combination'], dict):
+            raise ValueError("'combination' must be a dict")
+
+        # Ensure all packages are included
+        missing_packages = set(packages) - set(result['combination'].keys())
+        if missing_packages:
+            raise ValueError(f"Missing packages in combination: {missing_packages}")
+
+        # Set defaults for optional fields
+        if 'reasoning' not in result:
+            result['reasoning'] = "No reasoning provided"
+        if 'confidence' not in result:
+            result['confidence'] = "medium"
+
+        return result
+
+    except Exception as e:
+        print(f"   ❌ [LLM Error] Failed to suggest next combination: {e}")
+        # Fallback: return the first untried combination with newest versions
+        combination = {pkg: available_versions[pkg][0] for pkg in packages if available_versions.get(pkg)}
+        return {
+            "combination": combination,
+            "reasoning": f"Fallback selection (LLM failed: {e})",
+            "confidence": "low"
+        }

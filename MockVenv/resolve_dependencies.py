@@ -6,7 +6,13 @@ import itertools
 import llm_client
 import shutil
 import multiprocessing
+import subprocess
 from functools import partial
+from execution_trace_formatter import (
+    format_enhanced_resolution_report,
+    save_enhanced_report,
+    analyze_package_usage_frequency
+)
 
 # =====================================================================
 # ⚙️ Configuration
@@ -149,7 +155,7 @@ def resolve_import_to_pypi_name(import_name, pypi_import_mapping):
 # =====================================================================
 # 📦 PyPI Fetcher & Deductive Logic
 # =====================================================================
-def get_pypi_versions(package_name, resolve_name=True, return_canonical_name=False, filter_prereleases=False):
+def get_pypi_versions(package_name, resolve_name=True, return_canonical_name=False, filter_prereleases=False, return_release_dates=False):
     """
     Fetch all available versions for a package in real-time via the PyPI API.
 
@@ -158,10 +164,12 @@ def get_pypi_versions(package_name, resolve_name=True, return_canonical_name=Fal
         resolve_name: If True, resolve import name to PyPI name. If False, use package_name as-is.
         return_canonical_name: If True, return tuple (canonical_name, versions). If False, return only versions.
         filter_prereleases: If True, filter out pre-release versions (alpha, beta, rc). Default False.
+        return_release_dates: If True, also return release dates for each version.
 
     Returns:
-        If return_canonical_name=False: List of version strings sorted newest to oldest
-        If return_canonical_name=True: Tuple of (canonical_package_name, list of versions)
+        If return_canonical_name=False and return_release_dates=False: List of version strings sorted newest to oldest
+        If return_canonical_name=True: Tuple of (canonical_package_name, list of versions or dict with dates)
+        If return_release_dates=True: Dict {version: release_date}
     """
     pypi_name = _resolve_pypi_name_from_import(package_name) if resolve_name else package_name
     print(f"🔍 Fetching all versions for '{pypi_name}' from PyPI...")
@@ -175,126 +183,98 @@ def get_pypi_versions(package_name, resolve_name=True, return_canonical_name=Fal
             canonical_name = data["info"]["name"]
 
             # Get all versions from releases
-            all_releases = list(data["releases"].keys())
+            all_releases = data["releases"]
 
             # Optionally filter out pre-release versions
-            if filter_prereleases:
-                # More sophisticated pre-release detection
-                versions = []
-                for v in all_releases:
-                    v_lower = v.lower()
+            version_data = {}
+            for version, release_files in all_releases.items():
+                if filter_prereleases:
+                    v_lower = version.lower()
                     # Skip versions with common pre-release identifiers
                     if any(pre in v_lower for pre in ['rc', 'beta', 'alpha', 'dev', 'a0', 'b0', 'c0']):
                         continue
-                    versions.append(v)
+
+                # Get release date from first file in the release
+                release_date = "unknown"
+                if release_files and len(release_files) > 0:
+                    upload_time = release_files[0].get('upload_time_iso_8601') or release_files[0].get('upload_time')
+                    if upload_time:
+                        release_date = upload_time.split('T')[0]  # Extract date part
+
+                version_data[version] = release_date
+
+            sorted_versions = sorted(version_data.keys(), reverse=True)
+
+            if return_release_dates:
+                if return_canonical_name:
+                    return canonical_name, version_data
+                return version_data
             else:
-                versions = all_releases
-
-            sorted_versions = sorted(versions, reverse=True)
-
-            if return_canonical_name:
-                return canonical_name, sorted_versions
-            return sorted_versions
+                if return_canonical_name:
+                    return canonical_name, sorted_versions
+                return sorted_versions
     except Exception as e:
         print(f"⚠️ Failed to fetch versions for '{pypi_name}': {e}")
         if return_canonical_name:
+            if return_release_dates:
+                return package_name, {}
             return package_name, []
+        if return_release_dates:
+            return {}
         return []
 
 
-def analyze_api_signatures_for_hints(package_name, api_signatures, all_versions, testscript_dir=None):
+def get_all_pypi_versions_simple(package_name, requirements_versions=None):
     """
-    Use LLM to analyze API signatures and provide intelligent version hints.
+    Get all available versions from PyPI, optionally filtered by requirements.txt constraints.
 
-    This is a GENERAL-PURPOSE analyzer that works for any package by leveraging
-    LLM's knowledge of package version histories and API evolution patterns.
+    This function replaces the LLM-based version inference. Instead of using LLM to guess
+    which versions are compatible, we simply fetch all available versions from PyPI,
+    and the script_based_validator will test them to determine compatibility.
 
     Args:
-        package_name: Name of the package
-        api_signatures: List of API call signatures
-        all_versions: List of all available versions from PyPI
-        testscript_dir: Optional directory for test scripts
+        package_name: Name of the package (import name or PyPI name)
+        requirements_versions: Optional list of versions from requirements.txt to constrain search
 
     Returns:
-        dict with LLM-generated analysis results
+        List of version strings to test
     """
-    if not api_signatures or not all_versions:
-        return {
-            "detected_patterns": [],
-            "version_constraints": None,
-            "confidence": "low",
-            "reasoning": "Insufficient data for analysis"
-        }
-
     pypi_name = _resolve_pypi_name_from_import(package_name)
+    canonical_name, all_versions = get_pypi_versions(pypi_name, resolve_name=False, return_canonical_name=True)
 
-    # Prepare prompt for LLM analysis
-    prompt = f"""You are a Python package version analyzer with deep knowledge of PyPI packages and their API evolution.
+    if not all_versions:
+        print(f"   ⚠️ No versions found on PyPI for '{canonical_name}'")
+        return []
 
-Package: {pypi_name}
-Available Versions: {all_versions[:30] if len(all_versions) > 30 else all_versions}
-{'(Showing first 30 of ' + str(len(all_versions)) + ' versions)' if len(all_versions) > 30 else ''}
+    print(f"   📦 Found {len(all_versions)} versions on PyPI for '{canonical_name}'")
 
-Observed API Signatures (sample):
-{chr(10).join(api_signatures[:20])}
-{'(Showing first 20 of ' + str(len(api_signatures)) + ' signatures)' if len(api_signatures) > 20 else ''}
+    # If requirements.txt specifies versions, use those
+    if requirements_versions:
+        print(f"   📋 Filtering by requirements.txt: {requirements_versions}")
+        # Validate that the required versions exist in PyPI
+        validated_versions = []
+        for req_ver in requirements_versions:
+            # Try exact match first
+            if req_ver in all_versions:
+                validated_versions.append(req_ver)
+            else:
+                # Try case-insensitive match
+                req_ver_normalized = req_ver.strip().lower()
+                for pypi_ver in all_versions:
+                    if pypi_ver.strip().lower() == req_ver_normalized:
+                        validated_versions.append(pypi_ver)
+                        break
 
-TASK: Analyze these API signatures to identify version-specific patterns.
-
-Look for indicators such as:
-1. **Deprecated parameters**: Parameters that were removed or renamed in certain versions
-   - Example: PyJWT's `verify` parameter (existed in <2.0, changed to `options` in >=2.0)
-
-2. **New parameters**: Parameters that were added in specific versions
-   - Example: New optional parameters introduced in major versions
-
-3. **Method/class availability**: APIs that only exist in certain version ranges
-   - Example: New methods added in v2.0+, old methods removed in v3.0+
-
-4. **Signature changes**: Parameter order changes, type hint changes, or default value changes
-
-5. **Breaking changes**: Major version bumps that typically introduce incompatibilities
-
-Based on your analysis, return a JSON object with this structure:
-{{
-  "detected_patterns": ["list of specific patterns you detected"],
-  "version_constraints": "suggested version constraint (e.g., '<2.0', '>=2.5', '>=1.0,<2.0') or null if no strong constraint",
-  "confidence": "high/medium/low",
-  "reasoning": "clear explanation of why you suggested this constraint"
-}}
-
-IMPORTANT:
-- Only suggest version constraints if you detect CLEAR breaking change indicators
-- If APIs appear stable across versions, return confidence: "low" and version_constraints: null
-- Be conservative: prefer no constraint over incorrect constraint
-- Focus on ACTUAL API compatibility, not just guessing
-
-Your response (JSON only):"""
-
-    try:
-        # Use LLM to analyze the patterns
-        print(f"   🧠 [Pattern Analyzer] Asking LLM to analyze API patterns for {pypi_name}...")
-        result = llm_client.analyze_api_patterns(prompt, testscript_dir=testscript_dir)
-
-        if result and isinstance(result, dict):
-            print(f"   💡 [Pattern Analyzer] Confidence: {result.get('confidence', 'unknown')}")
-            return result
+        if validated_versions:
+            print(f"   ✅ Using {len(validated_versions)} versions from requirements.txt")
+            return validated_versions
         else:
-            print(f"   ⚠️ [Pattern Analyzer] Failed to get valid response")
-            return {
-                "detected_patterns": [],
-                "version_constraints": None,
-                "confidence": "low",
-                "reasoning": "LLM analysis failed"
-            }
-    except Exception as e:
-        print(f"   ⚠️ [Pattern Analyzer] Error during analysis: {e}")
-        return {
-            "detected_patterns": [],
-            "version_constraints": None,
-            "confidence": "low",
-            "reasoning": f"Analysis error: {e}"
-        }
+            print(f"   ⚠️ No matching versions from requirements.txt, using all {len(all_versions)} versions")
+            return all_versions
+
+    # Return all versions if no constraints
+    print(f"   ✅ Using all {len(all_versions)} available versions")
+    return all_versions
 
 
 def parse_api_calls_from_text(api_calls_text):
@@ -355,162 +335,93 @@ def parse_api_calls_from_text(api_calls_text):
     return api_by_package
 
 
-def infer_versions_from_llm(package_name, api_signatures, requirements_versions=None, testscript_dir=None):
+def get_versions_for_validation(package_name, api_signatures, requirements_versions=None, return_enhanced_info=False):
     """
-    Call the abstracted LLM Client to deduce an array of compatible versions
-    based on the observed API signatures.
+    Get package versions that need to be validated.
+
+    This function replaces the old LLM-based inference. Instead of using LLM to guess compatible
+    versions, we simply fetch all available versions from PyPI. The actual compatibility testing
+    will be done by script_based_validator.
 
     Args:
         package_name: Name of the package
-        api_signatures: List of API call signatures (e.g., ["semver.VersionInfo()", ...])
-        requirements_versions: Optional list of versions from requirements.txt to constrain search
-        testscript_dir: Optional directory for test scripts
+        api_signatures: List of API call signatures (for enhanced info only)
+        requirements_versions: Optional list of versions from requirements.txt (checked against PyPI)
+        return_enhanced_info: If True, return dict with versions and metadata
+
+    Returns:
+        If return_enhanced_info=False: List of version strings to test
+        If return_enhanced_info=True: Dict with keys: versions, reasoning, api_usage, release_dates
     """
     pypi_name = _resolve_pypi_name_from_import(package_name)
-    # Get all versions including pre-releases initially for better debugging
-    # Also get the canonical name from PyPI to ensure case-correct matching
-    # Use resolve_name=False since we already resolved the name above
-    canonical_name, all_versions_raw = get_pypi_versions(pypi_name, resolve_name=False, return_canonical_name=True)
+    canonical_name, all_versions = get_pypi_versions(pypi_name, resolve_name=False, return_canonical_name=True)
 
-    if not all_versions_raw:
+    # Also fetch release dates if enhanced info is requested
+    release_dates = {}
+    if return_enhanced_info:
+        _, release_dates = get_pypi_versions(pypi_name, resolve_name=False, return_canonical_name=True, return_release_dates=True)
+
+    if not all_versions:
+        if return_enhanced_info:
+            return {
+                "versions": [],
+                "reasoning": {"confidence": "none", "reasoning": "Package not found on PyPI"},
+                "api_usage": api_signatures if api_signatures else [],
+                "release_dates": {}
+            }
         return []
 
-    # If we have requirements.txt constraints, use those versions directly
-    # if requirements_versions:
-    #     # For pinned versions (from requirements.txt), we should use them as-is
-    #     # and not filter them further with LLM analysis
-    #     print(f"   📋 Using pinned versions from requirements.txt: {requirements_versions}")
+    print(f"📦 Fetching versions for '{package_name}'...")
+    print(f"   📊 Found {len(all_versions)} versions on PyPI")
 
-    #     # Validate that the required versions exist in PyPI (case-insensitive check)
-    #     validated_versions = []
-    #     for req_ver in requirements_versions:
-    #         # Try exact match first
-    #         if req_ver in all_versions_raw:
-    #             validated_versions.append(req_ver)
-    #         else:
-    #             # Try case-insensitive and whitespace-tolerant match
-    #             req_ver_normalized = req_ver.strip().lower()
-    #             found = False
-    #             for pypi_ver in all_versions_raw:
-    #                 if pypi_ver.strip().lower() == req_ver_normalized:
-    #                     validated_versions.append(pypi_ver)
-    #                     found = True
-    #                     break
+    # NEW: Check if requirements.txt version exists in PyPI
+    if requirements_versions:
+        print(f"   📋 Requirements.txt specifies: {requirements_versions}")
 
-    #             if not found:
-    #                 print(f"   ⚠️ Warning: Version '{req_ver}' from requirements.txt not found in PyPI")
-    #                 print(f"   💡 Attempting to use it anyway (PyPI may accept it)")
-    #                 # Still include the version even if not found in the filtered list
-    #                 # because PyPI's pre-release filter might have excluded it
-    #                 validated_versions.append(req_ver)
+        # Validate that requirements.txt versions exist in PyPI
+        missing_versions = []
+        for req_ver in requirements_versions:
+            if req_ver not in all_versions:
+                missing_versions.append(req_ver)
 
-    #     if not validated_versions:
-    #         print(f"   ⚠️ No versions from requirements.txt found in PyPI for '{canonical_name}'")
-    #         print(f"   📋 Requirements.txt versions: {requirements_versions}")
-    #         print(f"   📦 Available PyPI versions (first 20): {all_versions_raw[:20]}")
-    #         return []
+        if missing_versions:
+            # Version not found in PyPI - return only requirements.txt version
+            print(f"   ⚠️ WARNING: Version(s) {missing_versions} not found on PyPI!")
+            print(f"   ⚠️ This indicates a problem with the requirements.txt version")
+            print(f"   📌 Returning only requirements.txt version: {requirements_versions}")
 
-    #     # For requirements.txt pinned versions, skip LLM analysis and return directly
-    #     return validated_versions
+            if return_enhanced_info:
+                return {
+                    "versions": requirements_versions,  # Return requirements.txt version even if not on PyPI
+                    "reasoning": {
+                        "confidence": "error",
+                        "reasoning": f"Requirements.txt version(s) {missing_versions} not found on PyPI. Possible issues: version typo, package renamed, or version yanked from PyPI."
+                    },
+                    "api_usage": api_signatures if api_signatures else [],
+                    "release_dates": {},
+                    "error": "version_not_on_pypi"
+                }
+            return requirements_versions
+        else:
+            print(f"   ✅ Requirements.txt version(s) found on PyPI")
+            print(f"   🔄 Will test all {len(all_versions)} available versions")
+    else:
+        print(f"   ✅ Testing all {len(all_versions)} available versions")
 
-    # If no requirements.txt constraints, proceed with all versions
-    all_versions = all_versions_raw
+    versions_to_test = all_versions
 
-    if not api_signatures:
-        return all_versions
+    if return_enhanced_info:
+        return {
+            "versions": versions_to_test,
+            "reasoning": {
+                "confidence": "pending_validation",
+                "reasoning": "All versions fetched from PyPI, will be validated by script-based testing"
+            },
+            "api_usage": api_signatures if api_signatures else [],
+            "release_dates": {v: release_dates.get(v, "unknown") for v in versions_to_test}
+        }
 
-    print(f"🧠 [LLM Engine] Analyzing API signatures for '{package_name}'...")
-    print(f"   📊 Analyzing {len(api_signatures)} API calls against {len(all_versions)} versions")
-
-    # Analyze signatures for version hints using LLM
-    hints = analyze_api_signatures_for_hints(package_name, api_signatures, all_versions, testscript_dir=testscript_dir)
-    if hints["confidence"] in ["high", "medium"]:
-        print(f"   🔍 Detected patterns: {', '.join(hints['detected_patterns'])}")
-        if hints.get('version_constraints'):
-            print(f"   💡 Version hint: {hints['version_constraints']}")
-        print(f"   📝 Reasoning: {hints.get('reasoning', 'N/A')}")
-
-    # Enhanced prompt with better guidance on version range inference
-    # Build hints section dynamically based on LLM pattern analysis
-    hints_section = ""
-    if hints['confidence'] in ['high', 'medium']:
-        hints_section = f"""
-PATTERN ANALYSIS RESULTS (Confidence: {hints['confidence'].upper()}):
-{chr(10).join([f"- Detected Pattern: {p}" for p in hints['detected_patterns']]) if hints['detected_patterns'] else "- No specific patterns detected"}
-{f"- Suggested Version Constraint: {hints['version_constraints']}" if hints.get('version_constraints') else "- No version constraint suggested"}
-- Analysis Reasoning: {hints.get('reasoning', 'N/A')}
-"""
-
-    prompt = f"""You are an expert Python Dependency Resolution Engine with deep knowledge of PyPI packages and their version histories.
-
-TARGET PACKAGE: {canonical_name}
-
-AVAILABLE VERSIONS (sorted newest to oldest):
-{all_versions[:30] if len(all_versions) > 30 else all_versions}
-{'>>> Showing first 30 of ' + str(len(all_versions)) + ' total versions' if len(all_versions) > 30 else ''}
-
-OBSERVED API SIGNATURES (from actual runtime execution):
-Total API calls: {len(api_signatures)}
-{chr(10).join(api_signatures[:30])}
-{'>>> Showing first 30 signatures' if len(api_signatures) > 30 else ''}
-{hints_section}
-
-═══════════════════════════════════════════════════════════════
-TASK: VERSION COMPATIBILITY ANALYSIS
-═══════════════════════════════════════════════════════════════
-
-Your mission: Identify ALL versions of {canonical_name} that are compatible with the observed API signatures above.
-
-ANALYSIS METHODOLOGY:
-
-1. **API Signature Examination**:
-   - Examine each API call for version-specific indicators
-   - Look for deprecated/renamed parameters across version history
-   - Identify methods/classes that were added or removed in certain versions
-   - Pay attention to parameter types, default values, and calling conventions
-
-2. **Breaking Change Detection**:
-   - Major version bumps (e.g., 1.x → 2.x) often introduce breaking changes
-   - API deprecations typically happen across major versions
-   - Parameter renames, signature changes, or removed methods indicate incompatibility
-   - Only exclude versions with CONFIRMED incompatibilities
-
-3. **Version Range Strategy**:
-   - **DEFAULT APPROACH: Return BROAD ranges when APIs are stable**
-   - If an API pattern is stable across v1.0-v1.9, include ALL those versions
-   - Don't artificially narrow the range without evidence of breaking changes
-   - Multiple compatible versions are MORE valuable than a single version
-
-4. **Confidence Calibration**:
-   - High confidence: Clear breaking changes detected (e.g., parameter renames)
-   - Medium confidence: Partial evidence (e.g., major version pattern)
-   - Low confidence: Stable APIs across versions → return wider range
-
-5. **Evidence-Based Reasoning**:
-   - Base decisions on actual API compatibility, not speculation
-   - If pattern analysis suggests a constraint, validate it against the API signatures
-   - When in doubt, include the version (false positives better than false negatives)
-
-═══════════════════════════════════════════════════════════════
-OUTPUT FORMAT
-═══════════════════════════════════════════════════════════════
-
-Return ONLY a JSON array of compatible version strings (newest to oldest).
-Include ALL versions that could reasonably support these API patterns.
-
-Example: ["2.1.0", "2.0.9", "2.0.8", "2.0.7", "2.0.6", "2.0.5", "2.0.4"]
-
-Your response (JSON array only):"""
-
-    # 💡 Elegant one-line call to our LLM service hub
-    valid_versions = llm_client.infer_versions(prompt, testscript_dir=testscript_dir)
-
-    if valid_versions:
-        print(f"   ✅ [LLM Insight] Constrained from {len(all_versions)} down to {len(valid_versions)} compatible versions.")
-        return valid_versions
-
-    # Fallback strategy: if inference fails or returns empty, assume all stable versions
-    return all_versions
+    return versions_to_test
 
 
 def _resolve_requirements_package_name(package_name):
@@ -629,16 +540,18 @@ def _process_package_with_api(args):
         else:
             print(f"   📋 In requirements.txt (all versions allowed)")
 
-        # Infer compatible versions based on API signatures
-        versions = infer_versions_from_llm(import_name, api_signatures, req_versions, testscript_dir=testscript_dir)
+        # Get versions to validate (with enhanced info)
+        enhanced_result = get_versions_for_validation(import_name, api_signatures, req_versions,
+                                                       return_enhanced_info=True)
 
+        versions = enhanced_result.get('versions', [])
         if versions:
             print(f"   ✅ Result: {len(versions)} compatible versions found")
             print(f"   📌 Top versions: {versions[:5]}")
-            return (matched_req_pkg, versions, None)
+            return (matched_req_pkg, enhanced_result, None)
         else:
             print(f"   ⚠️ Result: No compatible versions found")
-            return (matched_req_pkg, [], None)
+            return (matched_req_pkg, enhanced_result, None)
 
     except Exception as e:
         error_msg = f"Error processing {import_name}: {str(e)}"
@@ -655,7 +568,7 @@ def _process_package_without_api(args):
         args: tuple of (idx, total, package_name, requirements)
 
     Returns:
-        tuple: (package_name, versions, error_msg)
+        tuple: (package_name, enhanced_result, error_msg)
     """
     idx, total, package_name, requirements = args
 
@@ -665,34 +578,119 @@ def _process_package_without_api(args):
         # Get version constraints from requirements.txt
         req_versions = requirements.get(package_name)
 
-        # Fetch all versions from PyPI
-        all_versions = get_pypi_versions(package_name, resolve_name=False)
+        # Fetch all versions from PyPI with release dates
+        canonical_name, release_dates = get_pypi_versions(
+            package_name, resolve_name=False, return_canonical_name=True, return_release_dates=True
+        )
+        all_versions = list(release_dates.keys())
 
         if all_versions:
-            # If requirements.txt specifies versions, use those; otherwise use all
+            print(f"   📦 Found {len(all_versions)} versions on PyPI for '{canonical_name}'")
+            print(f"   🔍 Testing installability with 'uv pip install'...")
+
+            # Test each version with uv pip install
+            installable_versions = []
+            tested_count = 0
+
+            for version in all_versions:
+                tested_count += 1
+                # Test if version can be installed with uv
+                import subprocess
+                import tempfile
+                import shutil
+
+                # Create a temporary venv for testing
+                temp_venv = tempfile.mkdtemp(prefix=f"test_venv_{canonical_name}_{version}_")
+                try:
+                    # Create venv
+                    result_create = subprocess.run(
+                        ["uv", "venv", temp_venv],
+                        capture_output=True,
+                        text=True,
+                        timeout=10
+                    )
+
+                    if result_create.returncode == 0:
+                        # Try to install the package
+                        result_install = subprocess.run(
+                            ["uv", "pip", "install", f"{canonical_name}=={version}"],
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                            env={**os.environ, "VIRTUAL_ENV": temp_venv}
+                        )
+
+                        if result_install.returncode == 0:
+                            installable_versions.append(version)
+                            if tested_count <= 5 or tested_count % 10 == 0:
+                                print(f"      ✅ [{tested_count}/{min(len(all_versions), max_test_limit)}] {canonical_name}=={version} is installable")
+                        else:
+                            if tested_count <= 5:
+                                print(f"      ❌ [{tested_count}/{min(len(all_versions), max_test_limit)}] {canonical_name}=={version} failed: {result_install.stderr.strip()[:100]}")
+
+                except subprocess.TimeoutExpired:
+                    if tested_count <= 5:
+                        print(f"      ⏱️ [{tested_count}/{min(len(all_versions), max_test_limit)}] {canonical_name}=={version} timed out")
+                except Exception as e:
+                    if tested_count <= 5:
+                        print(f"      ⚠️ [{tested_count}/{min(len(all_versions), max_test_limit)}] {canonical_name}=={version} error: {str(e)[:100]}")
+                finally:
+                    # Cleanup temp venv
+                    try:
+                        shutil.rmtree(temp_venv, ignore_errors=True)
+                    except:
+                        pass
+
+            # Use installable versions instead of all versions
+            final_versions = installable_versions
+
             if req_versions:
-                filtered_versions = [v for v in all_versions if v in req_versions]
-                if filtered_versions:
-                    print(f"   ✅ {len(filtered_versions)} versions from requirements.txt")
-                    print(f"   📌 Versions: {filtered_versions}")
-                    return (package_name, filtered_versions, None)
-                else:
-                    # Fall back to all versions if constraints don't match
-                    print(f"   ⚠️ No matching versions, using all {len(all_versions)} versions")
-                    print(f"   📌 Top versions: {all_versions[:5]}")
-                    return (package_name, all_versions, None)
+                print(f"   📋 Requirements.txt specifies: {req_versions}")
+
+            if final_versions:
+                print(f"   ✅ Found {len(final_versions)} installable versions (out of {len(all_versions)} total)")
+                print(f"   📌 Top installable versions: {final_versions[:5]}")
+
+                # Build enhanced result
+                enhanced_result = {
+                    "versions": final_versions,
+                    "reasoning": {
+                        "confidence": "medium",
+                        "reasoning": f"Tested with uv pip install, {len(final_versions)}/{len(all_versions)} versions are installable"
+                    },
+                    "api_usage": [],
+                    "release_dates": {v: release_dates.get(v, "unknown") for v in final_versions}
+                }
+                return (package_name, enhanced_result, None)
             else:
-                print(f"   ✅ All {len(all_versions)} versions allowed (no API constraints)")
-                print(f"   📌 Top versions: {all_versions[:5]}")
-                return (package_name, all_versions, None)
+                print(f"   ⚠️ No installable versions found for package: {package_name}")
+                enhanced_result = {
+                    "versions": [],
+                    "reasoning": {"confidence": "none", "reasoning": f"No installable versions found (tested {tested_count} versions)"},
+                    "api_usage": [],
+                    "release_dates": {}
+                }
+                return (package_name, enhanced_result, None)
         else:
             print(f"   ⚠️ No versions found on PyPI for package: {package_name}")
-            return (package_name, [], None)
+            enhanced_result = {
+                "versions": [],
+                "reasoning": {"confidence": "none", "reasoning": "Package not found on PyPI"},
+                "api_usage": [],
+                "release_dates": {}
+            }
+            return (package_name, enhanced_result, None)
 
     except Exception as e:
         error_msg = f"Error processing {package_name}: {str(e)}"
         print(f"   ❌ {error_msg}")
-        return (package_name, [], error_msg)
+        enhanced_result = {
+            "versions": [],
+            "reasoning": {"confidence": "error", "reasoning": str(e)},
+            "api_usage": [],
+            "release_dates": {}
+        }
+        return (package_name, enhanced_result, error_msg)
 
 
 def generate_package_combinations(resolved_packages):
@@ -721,21 +719,77 @@ def generate_package_combinations(resolved_packages):
     return all_combinations
 
 
-def generate_dockerfile(combination, base_image="python:3.11-slim", project_path=None, use_llm=True):
+def build_docker_image(dockerfile_path, image_tag, timeout=300):
+    """
+    Build a Docker image from a Dockerfile.
+
+    Args:
+        dockerfile_path: Path to the Dockerfile
+        image_tag: Tag for the Docker image (e.g., 'myapp:v1')
+        timeout: Build timeout in seconds (default: 300s = 5 minutes)
+
+    Returns:
+        tuple: (success: bool, error_message: str or None)
+    """
+    import subprocess
+    import time
+
+    dockerfile_dir = os.path.dirname(dockerfile_path)
+    dockerfile_name = os.path.basename(dockerfile_path)
+
+    print(f"   🐳 Building Docker image '{image_tag}' from {dockerfile_name}...")
+
+    try:
+        # Run docker build command
+        result = subprocess.run(
+            ['docker', 'build', '-f', dockerfile_name, '-t', image_tag, '.'],
+            cwd=dockerfile_dir,
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+
+        if result.returncode == 0:
+            print(f"      ✅ Docker build succeeded!")
+            return (True, None)
+        else:
+            error_msg = result.stderr if result.stderr else result.stdout
+            print(f"      ❌ Docker build failed!")
+            print(f"      Error: {error_msg[:500]}...")  # Print first 500 chars
+            return (False, error_msg)
+
+    except subprocess.TimeoutExpired:
+        error_msg = f"Docker build timed out after {timeout} seconds"
+        print(f"      ⏱️  {error_msg}")
+        return (False, error_msg)
+    except Exception as e:
+        error_msg = str(e)
+        print(f"      ❌ Docker build failed with exception: {error_msg}")
+        return (False, error_msg)
+
+
+def generate_dockerfile(combination, base_image="python:3.11-slim", project_path=None, use_llm=True, python_version=None):
     """
     Generate a Dockerfile for a specific package combination.
 
     Args:
         combination: dict {package_name: version}
-        base_image: Docker base image to use
+        base_image: Docker base image to use (will be overridden by python_version if provided)
         project_path: Optional path to project directory for volume mounting
         use_llm: If True, use LLM to generate content (default). If False, use template.
+        python_version: Optional Python version string (e.g., '3.10', '3.11', 'python3.10')
+                       If provided, will override base_image with appropriate python:<version>-slim
 
     Returns:
         dict with keys:
             - 'dockerfile': str (Dockerfile content)
             - 'readme_section': str (README section for this configuration)
     """
+    # Override base_image if python_version is provided
+    if python_version:
+        # Normalize python_version to just the version number (e.g., '3.10')
+        version_str = python_version.replace('python', '').strip()
+        base_image = f"python:{version_str}-slim"
     if use_llm:
         # 💡 Use LLM to generate Dockerfile and README content (without writing files)
         print(f"   🤖 Using LLM to generate Dockerfile content...")
@@ -751,9 +805,8 @@ def generate_dockerfile(combination, base_image="python:3.11-slim", project_path
 
 WORKDIR /app
 
-# Install packages WITHOUT their dependencies (--no-deps flag)
 # This ensures only the specified packages are installed, not their transitive dependencies
-RUN pip install --no-cache-dir --no-deps \\
+RUN pip install --no-cache-dir \\
 """
 
         # Add each package with its version
@@ -795,23 +848,393 @@ Interactive: `docker run -it myapp /bin/bash` (enter container directly)
         }
 
 
-def interactive_dockerfile_generation_optimized(resolved_packages, project_path=None, use_llm=True):
+def generate_version_combinations(resolved_packages, requirements, resolved_packages_enhanced, num_combinations):
     """
-    Allow user to interactively select how many Dockerfiles to generate.
-    Generates combinations on-demand to avoid memory issues.
+    Generate version combinations prioritizing requirements.txt versions.
+    Strategy:
+    1. First combination: all versions from requirements.txt
+    2. Subsequent combinations: modify 1-3 packages at a time
+
+    Args:
+        resolved_packages: dict {package_name: [list of compatible versions]}
+        requirements: dict {package_name: version_from_requirements}
+        resolved_packages_enhanced: dict with enhanced info including release_dates
+        num_combinations: Number of combinations to generate ('all' or number)
+
+    Returns:
+        list of dicts, each dict is {package_name: version}
+    """
+    packages = list(resolved_packages.keys())
+
+    # Build base combination from requirements.txt
+    base_combination = {}
+    version_lists_sorted = {}
+
+    for pkg in packages:
+        versions = resolved_packages[pkg]
+
+        # Sort versions by release date (newest first)
+        if resolved_packages_enhanced and pkg in resolved_packages_enhanced:
+            release_dates = resolved_packages_enhanced[pkg].get('release_dates', {})
+            if release_dates:
+                versions_with_dates = [(v, release_dates.get(v, "unknown")) for v in versions]
+                versions_with_dates.sort(key=lambda x: (x[1] in ("unknown", None), x[1] or ""), reverse=True)
+                sorted_versions = [v for v, _ in versions_with_dates]
+            else:
+                sorted_versions = versions
+        else:
+            sorted_versions = versions
+
+        version_lists_sorted[pkg] = sorted_versions
+
+        # Try to use version from requirements.txt
+        if pkg in requirements and requirements[pkg]:
+            req_version = requirements[pkg][0] if isinstance(requirements[pkg], list) else requirements[pkg]
+            if req_version in sorted_versions:
+                base_combination[pkg] = req_version
+            else:
+                # If requirements version not in compatible list, use newest
+                base_combination[pkg] = sorted_versions[0]
+        else:
+            # Use newest version
+            base_combination[pkg] = sorted_versions[0]
+
+    combinations = [base_combination.copy()]
+
+    # If num_combinations is 'all', generate all possible combinations
+    if num_combinations == 'all':
+        # Generate all combinations (can be very large!)
+        import itertools
+        all_version_lists = [version_lists_sorted[pkg] for pkg in packages]
+        for combo_tuple in itertools.product(*all_version_lists):
+            combo = {packages[i]: combo_tuple[i] for i in range(len(packages))}
+            if combo not in combinations:
+                combinations.append(combo)
+    else:
+        # Generate combinations by modifying 1-3 packages at a time
+        target_count = int(num_combinations)
+
+        # Strategy: modify packages one by one, then combinations of 2, then 3
+        for num_changes in [1, 2, 3]:
+            if len(combinations) >= target_count * 3:  # Generate 3x more to account for build failures
+                break
+
+            import itertools
+            for pkg_subset in itertools.combinations(packages, num_changes):
+                if len(combinations) >= target_count * 3:
+                    break
+
+                # For each package in subset, try different versions
+                pkg_version_choices = [version_lists_sorted[pkg] for pkg in pkg_subset]
+
+                for version_tuple in itertools.product(*pkg_version_choices):
+                    if len(combinations) >= target_count * 3:
+                        break
+
+                    new_combo = base_combination.copy()
+                    for i, pkg in enumerate(pkg_subset):
+                        new_combo[pkg] = version_tuple[i]
+
+                    # Skip if this combination already exists or is the base
+                    if new_combo not in combinations:
+                        combinations.append(new_combo)
+
+    return combinations
+
+
+def llm_guided_dockerfile_generation(resolved_packages, project_path=None, use_llm=True, python_version=None, resolved_packages_enhanced=None, num_dockerfiles=10, max_attempts=50, build_timeout=300, requirements=None):
+    """
+    Generate Dockerfiles by testing different version combinations.
+
+    This function iteratively:
+    1. Starts with versions from requirements.txt
+    2. Generates a Dockerfile and attempts to build it
+    3. If build fails, tries next pre-generated combination
+    4. If build succeeds, records it and continues
+    5. Repeats until we have the desired number of successful Dockerfiles
 
     Args:
         resolved_packages: dict {package_name: [list of compatible versions]}
         project_path: Optional path to project directory for volume mounting
         use_llm: If True, use LLM to generate Dockerfile content (default). If False, use template.
+        python_version: Optional Python version string (e.g., '3.10', '3.11') to use in Dockerfile base image
+        resolved_packages_enhanced: Optional dict with enhanced info including release_dates
+        num_dockerfiles: Number of successful Dockerfiles to generate (default: 10), or 'all'
+        max_attempts: Maximum number of build attempts before giving up (default: 50)
+        build_timeout: Timeout for each Docker build in seconds (default: 300)
+        requirements: dict {package_name: version_from_requirements} for prioritizing combinations
     """
     if not resolved_packages:
         print("❌ No packages to generate Dockerfiles from.")
         return
 
-    # Calculate total possible combinations
+    # Generate version combinations prioritizing requirements.txt
+    print("\n📅 Generating version combinations (prioritizing requirements.txt versions)...")
+
+    # Determine target number
+    if num_dockerfiles == 'all':
+        target_dockerfiles = 'all'
+        print("   🎯 Target: Generate ALL possible combinations")
+    else:
+        try:
+            target_dockerfiles = int(num_dockerfiles)
+            print(f"   🎯 Target: {target_dockerfiles} successful Dockerfiles")
+        except ValueError:
+            print(f"   ⚠️ Invalid num_dockerfiles value: {num_dockerfiles}, defaulting to 1")
+            target_dockerfiles = 1
+            num_dockerfiles = 1
+
+    # Generate combinations
+    if not requirements:
+        requirements = {}
+
+    all_combinations = generate_version_combinations(
+        resolved_packages,
+        requirements,
+        resolved_packages_enhanced,
+        num_dockerfiles
+    )
+
+    print(f"   ✅ Generated {len(all_combinations)} version combinations to try")
+    print(f"   📦 First combination (from requirements.txt):")
+    for pkg, ver in list(all_combinations[0].items())[:5]:
+        print(f"      • {pkg}=={ver}")
+    if len(all_combinations[0]) > 5:
+        print(f"      ... and {len(all_combinations[0]) - 5} more packages")
+
+    # Setup output directory
+    output_dir = "generated_dockerfiles"
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+    os.makedirs(output_dir)
+
+    print(f"\n🔨 Starting Docker build process...")
+    if target_dockerfiles == 'all':
+        print(f"   Target: ALL successful Dockerfiles (testing {len(all_combinations)} combinations)")
+    else:
+        print(f"   Target: {target_dockerfiles} successful Dockerfiles")
+    print(f"   Available combinations: {len(all_combinations)}")
+    print(f"   Build timeout: {build_timeout}s per Dockerfile")
+
+    # Track successful and failed combinations
+    successful_combinations = []
+    failed_combinations = []
+    attempt_count = 0
+    combination_index = 0
+
+    # Create summary file
+    summary_file = os.path.join(output_dir, "README.md")
+    with open(summary_file, 'w') as f:
+        f.write(f"# Dockerfile Generation Summary\n\n")
+        f.write(f"Generated at: {__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        if target_dockerfiles == 'all':
+            f.write(f"Target: ALL successful Dockerfiles\n\n")
+        else:
+            f.write(f"Target: {target_dockerfiles} successful Dockerfiles\n\n")
+
+        # Add Docker usage instructions
+        f.write(f"## 🐳 How to Run These Dockerfiles\n\n")
+        if project_path:
+            abs_project_path = os.path.abspath(project_path)
+            f.write(f"### Build and Run Example\n\n")
+            f.write(f"```bash\n")
+            f.write(f"# Build a Docker image\n")
+            f.write(f"cd {output_dir}\n")
+            f.write(f"docker build -f Dockerfile_1 -t myapp:v1 .\n\n")
+            f.write(f"# Run with project mounted\n")
+            f.write(f"docker run -it --rm -v {abs_project_path}:/app/project myapp:v1 /bin/bash\n")
+            f.write(f"```\n\n")
+        else:
+            f.write(f"```bash\n")
+            f.write(f"cd {output_dir}\n")
+            f.write(f"docker build -f Dockerfile_1 -t myapp:v1 .\n")
+            f.write(f"docker run -it --rm myapp:v1 /bin/bash\n")
+            f.write(f"```\n\n")
+
+        f.write(f"## Generated Configurations\n\n")
+
+    # Main loop: try each combination
+    while combination_index < len(all_combinations):
+        # Check if we've reached target (unless target is 'all')
+        if target_dockerfiles != 'all' and len(successful_combinations) >= target_dockerfiles:
+            break
+
+        current_combination = all_combinations[combination_index]
+        combination_index += 1
+        attempt_count += 1
+
+        print(f"\n{'='*80}")
+        if target_dockerfiles == 'all':
+            print(f"🔄 Attempt {attempt_count}/{len(all_combinations)} (Success: {len(successful_combinations)})")
+        else:
+            print(f"🔄 Attempt {attempt_count}/{len(all_combinations)} (Success: {len(successful_combinations)}/{target_dockerfiles})")
+        print(f"{'='*80}")
+
+        # Print current combination (show first 5 packages)
+        print(f"\n📦 Testing combination:")
+        pkg_items = list(current_combination.items())
+        for pkg, ver in pkg_items[:5]:
+            print(f"   • {pkg}=={ver}")
+        if len(pkg_items) > 5:
+            print(f"   ... and {len(pkg_items) - 5} more packages")
+
+        # Generate Dockerfile
+        generated_content = generate_dockerfile(
+            current_combination,
+            project_path=project_path,
+            use_llm=use_llm,
+            python_version=python_version
+        )
+
+        dockerfile_content = generated_content.get('dockerfile', '')
+        readme_section = generated_content.get('readme_section', '')
+
+        # Write Dockerfile to temp location
+        temp_dockerfile = os.path.join(output_dir, f"Dockerfile_temp")
+        with open(temp_dockerfile, 'w') as f:
+            f.write(dockerfile_content)
+
+        # Try to build the Docker image
+        image_tag = f"test_build_{attempt_count}"
+        success, error_message = build_docker_image(temp_dockerfile, image_tag, timeout=build_timeout)
+
+        if success:
+            # Build succeeded! Save this Dockerfile
+            success_idx = len(successful_combinations) + 1
+            final_filename = f"Dockerfile_{success_idx}"
+            final_filepath = os.path.join(output_dir, final_filename)
+
+            # Rename temp file to final name
+            os.rename(temp_dockerfile, final_filepath)
+
+            successful_combinations.append(current_combination.copy())
+
+            if target_dockerfiles == 'all':
+                print(f"\n   ✅ SUCCESS! Saved as {final_filename}")
+                print(f"      Progress: {len(successful_combinations)} successful so far")
+            else:
+                print(f"\n   ✅ SUCCESS! Saved as {final_filename}")
+                print(f"      Progress: {len(successful_combinations)}/{target_dockerfiles} successful")
+
+            # Add to README
+            with open(summary_file, 'a') as f:
+                f.write(f"### {final_filename} ✅\n")
+                if readme_section:
+                    f.write(readme_section)
+                else:
+                    f.write(f"```\n")
+                    # Show first 10 packages, then summarize rest
+                    pkg_items = list(current_combination.items())
+                    for pkg, ver in pkg_items[:10]:
+                        f.write(f"{pkg}=={ver}\n")
+                    if len(pkg_items) > 10:
+                        f.write(f"# ... and {len(pkg_items) - 10} more packages\n")
+                    f.write(f"```\n")
+                f.write("\n\n")
+
+        else:
+            # Build failed, record this combination and continue to next
+            failed_combinations.append(current_combination.copy())
+
+            print(f"\n   ❌ Build failed. Moving to next combination...")
+            if error_message:
+                # Show first 200 chars of error
+                error_preview = error_message[:200] + "..." if len(error_message) > 200 else error_message
+                print(f"      Error preview: {error_preview}")
+
+            # Remove temp file
+            if os.path.exists(temp_dockerfile):
+                os.remove(temp_dockerfile)
+
+    # Final summary
+    print(f"\n{'='*80}")
+    print(f"🎉 Dockerfile Generation Complete!")
+    print(f"{'='*80}")
+    if target_dockerfiles == 'all':
+        print(f"✅ Successfully built: {len(successful_combinations)} Dockerfiles")
+    else:
+        print(f"✅ Successfully built: {len(successful_combinations)}/{target_dockerfiles} Dockerfiles")
+    print(f"❌ Failed attempts: {len(failed_combinations)}")
+    print(f"📊 Total combinations tested: {attempt_count}/{len(all_combinations)}")
+    if attempt_count > 0:
+        print(f"📈 Success rate: {len(successful_combinations)/attempt_count*100:.1f}%")
+    print(f"📁 Output directory: {output_dir}/")
+    print(f"📄 Summary: {summary_file}")
+
+    # Update summary file with final statistics
+    with open(summary_file, 'a') as f:
+        f.write(f"\n## Final Statistics\n\n")
+        f.write(f"- Successful builds: {len(successful_combinations)}\n")
+        f.write(f"- Failed attempts: {len(failed_combinations)}\n")
+        f.write(f"- Total combinations tested: {attempt_count}\n")
+        if attempt_count > 0:
+            f.write(f"- Success rate: {len(successful_combinations)/attempt_count*100:.1f}%\n")
+
+    if target_dockerfiles != 'all' and len(successful_combinations) < target_dockerfiles:
+        print(f"\n⚠️  Warning: Only generated {len(successful_combinations)} successful Dockerfiles")
+        print(f"   Tested all {len(all_combinations)} available combinations")
+
+
+def interactive_dockerfile_generation_optimized(resolved_packages, project_path=None, use_llm=True, python_version=None, resolved_packages_enhanced=None):
+    """
+    Allow user to interactively select how many Dockerfiles to generate.
+    Generates combinations on-demand to avoid memory issues.
+
+    IMPORTANT: Dockerfiles are now sorted by release date (newest first) to prioritize
+    testing with the most recent package versions.
+
+    Args:
+        resolved_packages: dict {package_name: [list of compatible versions]}
+        project_path: Optional path to project directory for volume mounting
+        use_llm: If True, use LLM to generate Dockerfile content (default). If False, use template.
+        python_version: Optional Python version string (e.g., '3.10', '3.11') to use in Dockerfile base image
+        resolved_packages_enhanced: Optional dict with enhanced info including release_dates
+    """
+    if not resolved_packages:
+        print("❌ No packages to generate Dockerfiles from.")
+        return
+
+    # Sort each package's versions by release date (newest first)
+    print("\n📅 Sorting package versions by release date (newest first)...")
     packages = list(resolved_packages.keys())
-    version_lists = [resolved_packages[pkg] for pkg in packages]
+    version_lists_sorted = []
+
+    for pkg in packages:
+        versions = resolved_packages[pkg]
+
+        # Try to get release dates from enhanced info
+        if resolved_packages_enhanced and pkg in resolved_packages_enhanced:
+            release_dates = resolved_packages_enhanced[pkg].get('release_dates', {})
+            if release_dates:
+                # Sort versions by release date (newest first)
+                # Format: YYYY-MM-DD or "unknown"
+                versions_with_dates = []
+                for v in versions:
+                    date_str = release_dates.get(v, "unknown")
+                    versions_with_dates.append((v, date_str))
+
+                # Sort by date descending (newest first), treat "unknown" and None as oldest
+                versions_with_dates.sort(key=lambda x: (x[1] in ("unknown", None), x[1] or ""), reverse=True)
+                sorted_versions = [v for v, _ in versions_with_dates]
+
+                print(f"   ✅ {pkg}: Sorted {len(sorted_versions)} versions by release date")
+                print(f"      Newest: {sorted_versions[0]} ({release_dates.get(sorted_versions[0], 'unknown')})")
+                if len(sorted_versions) > 1:
+                    print(f"      Oldest: {sorted_versions[-1]} ({release_dates.get(sorted_versions[-1], 'unknown')})")
+
+                version_lists_sorted.append(sorted_versions)
+            else:
+                # No release dates available, use as-is
+                print(f"   ⚠️  {pkg}: No release dates available, using original order")
+                version_lists_sorted.append(versions)
+        else:
+            # No enhanced info, use as-is
+            print(f"   ⚠️  {pkg}: No enhanced info available, using original order")
+            version_lists_sorted.append(versions)
+
+    version_lists = version_lists_sorted
+
+    # Calculate total possible combinations
     total_combinations = 1
     for versions in version_lists:
         total_combinations *= len(versions)
@@ -903,7 +1326,6 @@ def interactive_dockerfile_generation_optimized(resolved_packages, project_path=
             f.write(f"### 📝 Important Notes\n\n")
             f.write(f"- **Container Purpose**: Containers are designed to stay running for manual interaction, not automatic execution\n")
             f.write(f"- **Project Mount Path**: Your project at `{abs_project_path}` will be mounted to `/app/project` inside the container\n")
-            f.write(f"- **No Dependencies Flag**: All packages are installed with `--no-deps` flag, meaning only the specified packages are installed WITHOUT their transitive dependencies\n")
             f.write(f"- **Live Updates**: Any changes to your project files on the host will be immediately reflected in the container\n")
             f.write(f"- **Manual Operations**: You can run your application manually inside the container as needed\n")
             f.write(f"- **Cleanup**: Remove unused images with `docker rmi myapp:v1 myapp:v2 ...`\n\n")
@@ -934,7 +1356,6 @@ def interactive_dockerfile_generation_optimized(resolved_packages, project_path=
             f.write(f"```\n\n")
             f.write(f"### 📝 Important Notes\n\n")
             f.write(f"- **Container Purpose**: Containers are designed to stay running for manual interaction, not automatic execution\n")
-            f.write(f"- **No Dependencies Flag**: All packages are installed with `--no-deps` flag, meaning only the specified packages are installed WITHOUT their transitive dependencies\n")
             f.write(f"- **Manual Operations**: You can run your application manually inside the container as needed\n")
             f.write(f"- **Volume Mounting**: You can mount your project directory using `-v` flag when running the container\n")
             f.write(f"- **Cleanup**: Remove unused images with `docker rmi myapp:v1 myapp:v2 ...`\n\n")
@@ -949,7 +1370,7 @@ def interactive_dockerfile_generation_optimized(resolved_packages, project_path=
         combination = {packages[j]: combo[j] for j in range(len(packages))}
 
         # 💡 Call LLM to generate Dockerfile and README content (LLM won't write files)
-        generated_content = generate_dockerfile(combination, project_path=project_path, use_llm=use_llm)
+        generated_content = generate_dockerfile(combination, project_path=project_path, use_llm=use_llm, python_version=python_version)
 
         # 📝 Extract content from LLM response
         dockerfile_content = generated_content.get('dockerfile', '')
@@ -1005,7 +1426,6 @@ def interactive_dockerfile_generation_optimized(resolved_packages, project_path=
         print(f"   docker run -it --rm -v {abs_project_path}:/app/project myapp:v2 /bin/bash")
         print(f"\n💡 Important Notes:")
         print(f"   • Containers are designed for manual interaction, not automatic execution")
-        print(f"   • Packages are installed with --no-deps flag (NO transitive dependencies)")
         print(f"   • The project at '{abs_project_path}' will be mounted to '/app/project' in the container")
         print(f"   • You can run your application manually inside the container")
         print(f"   • See {summary_file} for detailed usage instructions")
@@ -1025,7 +1445,6 @@ def interactive_dockerfile_generation_optimized(resolved_packages, project_path=
         print(f"   docker run -it --rm myapp:v1 /bin/bash")
         print(f"\n💡 Important Notes:")
         print(f"   • Containers are designed for manual interaction, not automatic execution")
-        print(f"   • Packages are installed with --no-deps flag (NO transitive dependencies)")
         print(f"   • You can mount your project using -v flag when running the container")
         print(f"   • See {summary_file} for detailed usage instructions")
         print(f"{'='*60}")
@@ -1074,8 +1493,9 @@ def main():
     # Parse command line arguments
     if len(sys.argv) < 2:
         print("❌ Error: State file path is required")
-        print("Usage: python resolve_dependencies.py <state_file_path> [mode] [requirements_file] [project_path] [use_llm]")
+        print("Usage: python resolve_dependencies.py <state_file_path> [mode] [requirements_file] [project_path] [use_llm] [python_version] [num_dockerfiles]")
         print("  use_llm: 'true' (default) to use LLM for Dockerfile generation, 'false' to use template")
+        print("  num_dockerfiles: Number of Dockerfiles to generate: 'all' for all combinations, or a number (default: '1')")
         sys.exit(1)
 
     state_file = sys.argv[1]
@@ -1084,6 +1504,8 @@ def main():
     project_path = sys.argv[4] if len(sys.argv) > 4 else None
     use_llm_arg = sys.argv[5] if len(sys.argv) > 5 else 'true'
     use_llm = use_llm_arg.lower() != 'false'  # Default to True unless explicitly set to 'false'
+    python_version = sys.argv[6] if len(sys.argv) > 6 else "3.10"
+    num_dockerfiles_arg = sys.argv[7] if len(sys.argv) > 7 else "1"
 
     if not os.path.exists(state_file):
         print(f"\n❌ File not found: {state_file}")
@@ -1094,6 +1516,7 @@ def main():
     if project_path:
         print(f"📁 Project path: {project_path}")
     print(f"🤖 LLM Dockerfile Generation: {'Enabled' if use_llm else 'Disabled (using template)'}")
+    print(f"🐍 Python version for validation: {python_version}")
 
     # Load requirements.txt for package constraints
     requirements = load_requirements_txt(requirements_path)
@@ -1104,14 +1527,15 @@ def main():
 
     # Dictionary to store the resolved configuration
     resolved_packages = {}
+    resolved_packages_enhanced = {}  # Enhanced info with reasoning, api_usage, etc.
 
-    # Create testscript directory for Claude Code to write test scripts (in resolve mode)
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    testscript_dir = os.path.join(script_dir, "testscript")
-    os.makedirs(testscript_dir, exist_ok=True)
-    print(f"📁 Test script directory: {testscript_dir}")
+    # Define testscript_dir for cleanup purposes
+    testscript_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "generated_test_scripts")
 
-    if mode == 'real':
+    # Always perform validation, do not skip based on filename
+    skip_all_validation = False
+
+    if mode == 'real' and not skip_all_validation:
         # Read requirements.txt and store all package names
         print("\n" + "="*50)
         print("📋 STEP 1: Reading requirements.txt and storing all package names")
@@ -1157,7 +1581,7 @@ def main():
         total_packages = len(api_package_items)
 
         process_args = [
-            (idx, total_packages, import_name, api_signatures, pypi_import_mapping, requirements_packages, requirements, testscript_dir)
+            (idx, total_packages, import_name, api_signatures, PYPI_IMPORT_MAPPING, requirements_packages, requirements, testscript_dir)
             for idx, (import_name, api_signatures) in enumerate(api_package_items, 1)
         ]
 
@@ -1168,12 +1592,15 @@ def main():
         # Collect results
         for result in results:
             if result is not None:
-                matched_req_pkg, versions, error_msg = result
+                matched_req_pkg, enhanced_result, error_msg = result
                 if error_msg:
                     print(f"   ⚠️ Warning: {error_msg}")
-                elif versions:
-                    resolved_packages[matched_req_pkg] = versions
-                    matched_requirements_packages.add(matched_req_pkg)
+                else:
+                    versions = enhanced_result.get('versions', [])
+                    if versions:
+                        resolved_packages[matched_req_pkg] = versions
+                        resolved_packages_enhanced[matched_req_pkg] = enhanced_result
+                        matched_requirements_packages.add(matched_req_pkg)
 
         # For packages in requirements.txt without API logs, add all versions
         print("\n" + "="*50)
@@ -1202,11 +1629,14 @@ def main():
 
             # Collect results
             for result in results:
-                package_name, versions, error_msg = result
+                package_name, enhanced_result, error_msg = result
                 if error_msg:
                     print(f"   ⚠️ Warning: {error_msg}")
-                elif versions:
-                    resolved_packages[package_name] = versions
+                else:
+                    versions = enhanced_result.get('versions', [])
+                    if versions:
+                        resolved_packages[package_name] = versions
+                        resolved_packages_enhanced[package_name] = enhanced_result
         else:
             print("✅ All packages in requirements.txt have API logs")
 
@@ -1241,10 +1671,13 @@ def main():
                 for api_name, api_info in features.items():
                     api_signatures.append(f"{pkg}.{api_name}()")
 
-            versions = infer_versions_from_llm(pkg, api_signatures, req_versions, testscript_dir=testscript_dir)
+            enhanced_result = get_versions_for_validation(pkg, api_signatures, req_versions,
+                                                          return_enhanced_info=True)
+            versions = enhanced_result.get('versions', [])
 
             if versions:
                 resolved_packages[pypi_name] = versions
+                resolved_packages_enhanced[pypi_name] = enhanced_result
                 print(f"   ✅ '{pypi_name}': Locked in {len(versions)} compatible versions")
 
     # =================================================================
@@ -1254,10 +1687,15 @@ def main():
     print("💾 STEP 4: Saving results")
     print("="*50)
 
-    config_output_path = "resolved_versions.json"
+    # Create result directory if it doesn't exist
+    result_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "result")
+    os.makedirs(result_dir, exist_ok=True)
+
+    config_output_path = os.path.join(result_dir, "resolved_versions.json")
     resolved_config = {
         "mode": mode,
         "resolved_packages": resolved_packages,
+        "resolved_packages_enhanced": resolved_packages_enhanced,
         "total_packages": len(resolved_packages),
         "generated_at": __import__('datetime').datetime.now().isoformat()
     }
@@ -1267,6 +1705,109 @@ def main():
 
     print(f"✅ Saved resolved versions to: {config_output_path}")
     print(f"   📦 Total packages resolved: {len(resolved_packages)}")
+
+    # =================================================================
+    # 🧪 STEP 4.5: Script-based Version Validation (Real Mode Only)
+    # =================================================================
+    if mode == 'real' and resolved_packages and not skip_all_validation:
+        print("\n" + "="*50)
+        print("🧪 STEP 4.5: Script-based Version Validation")
+        print("="*50)
+        print("This step validates package versions by:")
+        print("  1. Using LLM to generate test scripts based on API logs")
+        print("  2. Creating uv virtual environments for each version")
+        print("  3. Running actual tests to verify API compatibility")
+        print("Versions that fail tests will be filtered out.")
+
+        try:
+            # Import script-based validator
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            sys.path.insert(0, script_dir)
+            from script_based_validator import validate_all_packages_with_scripts
+
+            # Calculate optimal parallel workers: min(32, cpu_count())
+            cpu_count = multiprocessing.cpu_count()
+            optimal_workers = min(32, cpu_count)
+            print(f"🖥️  Using {optimal_workers} parallel workers (CPU count: {cpu_count})")
+
+            # Run script-based validation with retry logic
+            validated_output = os.path.join(result_dir, "validated_versions.json")
+            validate_all_packages_with_scripts(
+                api_calls_file=state_file,
+                resolved_versions_file=config_output_path,
+                output_file=validated_output,
+                python_version=python_version,
+                max_workers=optimal_workers,
+                timeout=30,  # Timeout per version test
+                requirements_file=requirements_path if requirements_path else None,
+                max_retries=5  # Retry up to 5 times for inference failures
+            )
+
+            # Load validated versions and replace resolved_packages
+            with open(validated_output, 'r') as f:
+                validated_data = json.load(f)
+
+            validated_packages = validated_data.get('resolved_packages', {})
+            if validated_packages:
+                print("\n✅ Validation complete. Using validated versions for Dockerfile generation.")
+                # Update resolved_packages with validated versions
+                resolved_packages = validated_packages
+
+                # Delete intermediate resolved_versions.json file since we have validated_versions.json
+                intermediate_resolved_path = os.path.join(result_dir, "resolved_versions.json")
+                if os.path.exists(intermediate_resolved_path) and intermediate_resolved_path != validated_output:
+                    try:
+                        os.remove(intermediate_resolved_path)
+                        print(f"   🗑️  Removed intermediate file: {intermediate_resolved_path}")
+                    except Exception as e:
+                        print(f"   ⚠️ Warning: Could not remove intermediate file: {e}")
+
+                # Update config_output_path to use validated versions
+                config_output_path = validated_output
+            else:
+                print("\n⚠️ Validation produced no results. Using original resolved versions.")
+
+        except ImportError as e:
+            print(f"\n⚠️ Warning: Could not import script_based_validator: {e}")
+            print("   Continuing with resolved versions only.")
+        except Exception as e:
+            print(f"\n⚠️ Warning: Version validation failed: {e}")
+            print("   Continuing with resolved versions only.")
+            import traceback
+            traceback.print_exc()
+
+    # =================================================================
+    # 📊 Generate Enhanced User-Friendly Report
+    # =================================================================
+    if mode == 'real':
+        print("\n" + "="*50)
+        print("📊 Generating enhanced resolution report")
+        print("="*50)
+
+        # Get paths for trace files
+        venv_dir = os.path.dirname(state_file)
+        execution_trace_file = os.path.join(venv_dir, ".execution_trace.json")
+
+        # Generate and save the enhanced report
+        enhanced_report_path = "resolution_report.txt"
+        try:
+            save_enhanced_report(
+                resolved_packages_enhanced,
+                state_file,  # .api_calls.json
+                enhanced_report_path,
+                execution_trace_file if os.path.exists(execution_trace_file) else None,
+                project_path
+            )
+            print(f"✅ Enhanced resolution report saved to: {enhanced_report_path}")
+            print(f"   This report includes:")
+            print(f"      • Program execution trace")
+            print(f"      • Package usage frequency ranking")
+            print(f"      • Detailed version reasoning for each package")
+            print(f"      • Release dates for compatible versions")
+        except Exception as e:
+            print(f"⚠️ Warning: Failed to generate enhanced report: {e}")
+            import traceback
+            traceback.print_exc()
 
     # Print summary
     print("\n📊 Summary of resolved packages:")
@@ -1282,73 +1823,165 @@ def main():
         print(f"   We'll let you choose how many Dockerfiles to generate instead.")
 
     # =================================================================
-    # 🐳 Interactive Dockerfile Generation (without generating all combinations)
+    # 🐳 LLM-Guided Dockerfile Generation with Build Testing
     # =================================================================
     print("\n" + "="*50)
-    print("🐳 STEP 5: Dockerfile Generation")
+    print("🐳 STEP 5: LLM-Guided Dockerfile Generation")
     print("="*50)
 
-    # Generate combinations on-demand during dockerfile generation
-    # This avoids memory issues with large combination sets
-    interactive_dockerfile_generation_optimized(resolved_packages, project_path=project_path, use_llm=use_llm)
-
-    # =================================================================
-    # 🧹 Cleanup: Remove test scripts and documentation from testscript directory
-    # =================================================================
-    print("\n" + "="*50)
-    print("🧹 STEP 6: Cleanup testscript directory")
-    print("="*50)
-
-    if os.path.exists(testscript_dir):
-        # Patterns to match files that should be removed
-        cleanup_patterns = [
-            '**/*test*.py',         # Test files
-            '**/*demo*.py',         # Demo files
-            '**/*example*.py',      # Example files
-            '**/*.md',              # Markdown documentation
-            '**/*.txt',             # Text documentation
-            '**/*.rst',             # ReStructuredText documentation
-            '**/README*',           # README files
-            '**/CHANGELOG*',        # Changelog files
-            '**/LICENSE*',          # License files
-            '**/docs/**/*',         # Documentation directories
-        ]
-
-        import glob
-        removed_files = []
-
-        for pattern in cleanup_patterns:
-            full_pattern = os.path.join(testscript_dir, pattern)
-            for file_path in glob.glob(full_pattern, recursive=True):
-                # Skip if it's a directory
-                if os.path.isdir(file_path):
-                    continue
-
-                try:
-                    os.remove(file_path)
-                    removed_files.append(os.path.relpath(file_path, testscript_dir))
-                    print(f"   🗑️ Removed: {os.path.relpath(file_path, testscript_dir)}")
-                except Exception as e:
-                    print(f"   ⚠️ Failed to remove {file_path}: {e}")
-
-        if removed_files:
-            print(f"\n✅ Cleaned up {len(removed_files)} file(s) from testscript directory")
-        else:
-            print(f"\n✅ No cleanup needed in testscript directory")
-
-        # Remove empty directories
+    # Parse num_dockerfiles parameter
+    if num_dockerfiles_arg.lower() == 'all':
+        num_dockerfiles_to_generate = 'all'
+    else:
         try:
-            for root, dirs, files in os.walk(testscript_dir, topdown=False):
-                for dir_name in dirs:
-                    dir_path = os.path.join(root, dir_name)
-                    try:
-                        if not os.listdir(dir_path):  # Check if directory is empty
-                            os.rmdir(dir_path)
-                            print(f"   🗑️ Removed empty directory: {os.path.relpath(dir_path, testscript_dir)}")
-                    except Exception:
-                        pass
+            num_dockerfiles_to_generate = int(num_dockerfiles_arg)
+        except ValueError:
+            print(f"⚠️ Invalid num_dockerfiles value: {num_dockerfiles_arg}, defaulting to 1")
+            num_dockerfiles_to_generate = 1
+
+    # Generate Dockerfiles by testing different version combinations
+    llm_guided_dockerfile_generation(
+        resolved_packages,
+        project_path=project_path,
+        use_llm=use_llm,
+        python_version=python_version,
+        resolved_packages_enhanced=resolved_packages_enhanced,
+        num_dockerfiles=num_dockerfiles_to_generate,
+        max_attempts=50,     # Not used anymore, kept for compatibility
+        build_timeout=300,   # 5 minutes per build
+        requirements=requirements
+    )
+
+    # =================================================================
+    # 🧹 STEP 6: Cleanup and Generate Final Output Files
+    # =================================================================
+    print("\n" + "="*50)
+    print("🧹 STEP 6: Cleanup and Generate Final Output Files")
+    print("="*50)
+
+    # 6.1: Remove intermediate directories and old result files (not needed in final output)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Remove testscript directory
+    if os.path.exists(testscript_dir):
+        try:
+            shutil.rmtree(testscript_dir)
+            print(f"   ✅ Removed intermediate directory: {testscript_dir}")
         except Exception as e:
-            print(f"   ⚠️ Warning during directory cleanup: {e}")
+            print(f"   ⚠️ Warning: Failed to remove testscript directory: {e}")
+
+    # # Remove generated_dockerfiles directory
+    # dockerfiles_dir = os.path.join(base_dir, "generated_dockerfiles")
+    # if os.path.exists(dockerfiles_dir):
+    #     try:
+    #         shutil.rmtree(dockerfiles_dir)
+    #         print(f"   ✅ Removed intermediate directory: {dockerfiles_dir}")
+    #     except Exception as e:
+    #         print(f"   ⚠️ Warning: Failed to remove dockerfiles directory: {e}")
+
+    # 6.2: Generate final output files (only keep these two essential files)
+    print("\n" + "="*50)
+    print("📤 Generating Final Output Files")
+    print("="*50)
+
+    # Get the .venv directory path
+    venv_dir = os.path.dirname(state_file) if state_file else os.path.join(os.getcwd(), ".venv")
+
+    # Output File 1: Execution Trace (copy from .venv/.execution_trace.json)
+    execution_trace_source = os.path.join(venv_dir, ".execution_trace.json")
+    execution_trace_output = os.path.join(result_dir, "execution_trace.json")
+
+    if os.path.exists(execution_trace_source):
+        shutil.copy2(execution_trace_source, execution_trace_output)
+        print(f"   ✅ File 1: Execution trace → {execution_trace_output}")
+
+        # Show file size
+        file_size = os.path.getsize(execution_trace_output)
+        print(f"      Size: {file_size:,} bytes ({file_size / 1024:.1f} KB)")
+    else:
+        print(f"   ⚠️ Warning: Execution trace not found at {execution_trace_source}")
+
+    # Output File 2: Inferred Package Versions
+    # Extract only successfully inferred packages (exclude inference_failed cases)
+    inferred_versions_output = os.path.join(result_dir, "inferred_package_versions.json")
+
+    if mode == 'real' and os.path.exists(config_output_path):
+        try:
+            # Load the final validated versions
+            with open(config_output_path, 'r') as f:
+                final_data = json.load(f)
+
+            validation_report = final_data.get('validation_report', {})
+            packages_info = validation_report.get('packages', {})
+
+            # Filter to only include successfully inferred packages
+            successfully_inferred = {}
+            failed_packages = {}
+
+            for pkg_name, versions in resolved_packages.items():
+                pkg_info = packages_info.get(pkg_name, {})
+                status = pkg_info.get('status', 'unknown')
+
+                if status in ['validated_success', 'no_api_calls_kept_all']:
+                    # Successfully inferred
+                    successfully_inferred[pkg_name] = {
+                        "versions": versions,
+                        "status": status,
+                        "retry_count": pkg_info.get('retry_count', 0),
+                        "compatible_versions": pkg_info.get('compatible_versions', len(versions)),
+                        "candidate_versions": pkg_info.get('candidate_versions', len(versions))
+                    }
+                else:
+                    # Inference failed
+                    failed_packages[pkg_name] = {
+                        "status": status,
+                        "retry_count": pkg_info.get('retry_count', 0),
+                        "kept_version": versions[0] if versions else "unknown"
+                    }
+
+            # Create output data
+            inferred_output_data = {
+                "mode": mode,
+                "python_version": python_version,
+                "generated_at": final_data.get('validated_at', final_data.get('generated_at', 'unknown')),
+                "summary": {
+                    "total_packages": len(resolved_packages),
+                    "successfully_inferred": len(successfully_inferred),
+                    "inference_failed": len(failed_packages)
+                },
+                "successfully_inferred_packages": successfully_inferred,
+                "failed_packages": failed_packages
+            }
+
+            # Save to file
+            with open(inferred_versions_output, 'w') as f:
+                json.dump(inferred_output_data, f, indent=4)
+
+            print(f"   ✅ File 2: Inferred package versions → {inferred_versions_output}")
+            print(f"      Successfully inferred: {len(successfully_inferred)} packages")
+            print(f"      Inference failed: {len(failed_packages)} packages")
+
+            # Show file size
+            file_size = os.path.getsize(inferred_versions_output)
+            print(f"      Size: {file_size:,} bytes ({file_size / 1024:.1f} KB)")
+
+        except Exception as e:
+            print(f"   ⚠️ Warning: Failed to generate inferred versions file: {e}")
+            import traceback
+            traceback.print_exc()
+
+    print("\n" + "="*50)
+    print("✅ Final Output Summary")
+    print("="*50)
+    if mode == 'real':
+        # Determine the description based on whether validation was skipped
+        version_desc = "fixed package versions" if skip_all_validation else "validated package versions"
+        print(f"   📄 Output File 1: {config_output_path} ({version_desc})")
+        print(f"   📄 Output File 2: {execution_trace_output} (program execution trace)")
+        print(f"   📄 Output File 3: {inferred_versions_output} (successfully inferred packages)")
+    else:
+        print(f"   📄 Output File 1: {config_output_path} (resolved package versions)")
+    print("="*50)
 
 
 if __name__ == "__main__":

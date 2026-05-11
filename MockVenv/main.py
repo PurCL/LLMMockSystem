@@ -574,7 +574,7 @@ You MUST return ONLY valid JSON format without any markdown or additional text."
     print("=" * 60)
 
 
-def resolve_dependencies(mock_state_path=None, mode='mock', requirements_path=None, project_path=None, use_llm=True):
+def resolve_dependencies(mock_state_path=None, mode='mock', requirements_path=None, project_path=None, use_llm=True, python_version=None, num_dockerfiles="1"):
     """
     Analyze the .mock_state.json or .api_calls.json file to generate resolved version configurations.
 
@@ -587,6 +587,8 @@ def resolve_dependencies(mock_state_path=None, mode='mock', requirements_path=No
         requirements_path: Optional path to requirements.txt file for package constraints
         project_path: Optional path to project directory for Docker volume mounting
         use_llm: If True (default), use LLM to generate Dockerfile content. If False, use template.
+        python_version: Optional Python version to use for validation (e.g., '3.10', '3.11')
+        num_dockerfiles: Number of Dockerfiles to generate: 'all' for all combinations, or a number (default: "1")
 
     This function calls resolve_dependencies.py to:
     - Read the state file containing intercepted API features
@@ -636,7 +638,7 @@ def resolve_dependencies(mock_state_path=None, mode='mock', requirements_path=No
         print(f"❌ Error: resolve_dependencies.py not found at: {resolve_script}")
         sys.exit(1)
 
-    # Execute resolve_dependencies.py with the state file path, mode, requirements path, project path, and use_llm
+    # Execute resolve_dependencies.py with the state file path, mode, requirements path, project path, use_llm, and python_version
     cmd = [sys.executable, resolve_script, mock_state_path, mode]
     if requirements_path:
         cmd.append(requirements_path)
@@ -650,6 +652,15 @@ def resolve_dependencies(mock_state_path=None, mode='mock', requirements_path=No
 
     # Add use_llm parameter
     cmd.append('true' if use_llm else 'false')
+
+    # Add python_version parameter
+    if python_version:
+        cmd.append(python_version)
+    else:
+        cmd.append("")  # Empty placeholder for python_version
+
+    # Add num_dockerfiles parameter
+    cmd.append(num_dockerfiles)
 
     try:
         subprocess.run(cmd, check=True)
@@ -785,6 +796,14 @@ Examples:
         help="Force template-based Dockerfile generation (default behavior in 'real' mode, optional override in 'mock' mode)"
     )
 
+    parser.add_argument(
+        "--dockerfiles",
+        type=str,
+        metavar="NUMBER",
+        default="1",
+        help="Number of Dockerfiles to generate: 'all' for all combinations, or a number (default: 1)"
+    )
+
     # Parse arguments
     args = parser.parse_args()
 
@@ -826,10 +845,10 @@ Examples:
 
         # If args.resolve is True (no path provided), use default path
         if args.resolve is True:
-            resolve_dependencies(mode=args.mode, requirements_path=args.requirements, project_path=args.project, use_llm=use_llm)
+            resolve_dependencies(mode=args.mode, requirements_path=args.requirements, project_path=args.project, use_llm=use_llm, python_version=args.python, num_dockerfiles=args.dockerfiles)
         else:
             # Custom path provided
-            resolve_dependencies(args.resolve, mode=args.mode, requirements_path=args.requirements, project_path=args.project, use_llm=use_llm)
+            resolve_dependencies(args.resolve, mode=args.mode, requirements_path=args.requirements, project_path=args.project, use_llm=use_llm, python_version=args.python, num_dockerfiles=args.dockerfiles)
 
 
 if __name__ == "__main__":

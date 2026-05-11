@@ -30,6 +30,7 @@ print(f"[⚙️ Ghost Engine] API log file: {API_LOG_FILE}")
 
 # API call log for real mode
 api_call_signatures = set()  # Fast lookup for existing signatures
+api_call_trace = []  # Ordered list of API calls with execution trace info
 log_lock = threading.Lock()  # Thread-safe logging
 
 # Initialize log file (create empty file if it doesn't exist)
@@ -179,8 +180,8 @@ def _should_trace_module(module_name):
 # =====================================================================
 # 📝 API Call Logging
 # =====================================================================
-def _log_api_call(api_signature, args_info=None, kwargs_info=None):
-    """Log API call signature in real mode (thread-safe)"""
+def _log_api_call(api_signature, args_info=None, kwargs_info=None, caller_info=None):
+    """Log API call signature in real mode (thread-safe) with execution trace"""
     # Skip if already logged
     if api_signature in api_call_signatures:
         return
@@ -226,6 +227,14 @@ def _log_api_call(api_signature, args_info=None, kwargs_info=None):
         # Build the final function call string
         params_str = ', '.join(params)
         call_string = f"{api_signature}({params_str})\n"
+
+        # Add to trace list with caller information
+        trace_entry = {
+            "api": api_signature,
+            "params": params_str,
+            "caller": caller_info or {}
+        }
+        api_call_trace.append(trace_entry)
 
         # Append to file without reading it first
         try:
@@ -415,8 +424,27 @@ def _trace_calls(frame, event, arg):
                     except Exception:
                         kwargs_dict[var] = "<unprintable>"
 
-        # Log the call with actual argument values
-        _log_api_call(full_path, args_info=args_dict, kwargs_info=kwargs_dict)
+        # Collect caller information for execution trace
+        caller_info = {
+            "file": filename,
+            "line": frame.f_lineno,
+            "function": func_name
+        }
+
+        # Try to find the user code that initiated this call
+        user_frame = frame.f_back
+        while user_frame:
+            user_filename = user_frame.f_code.co_filename
+            if user_filename and 'site-packages' not in user_filename:
+                # Found user code
+                caller_info["user_file"] = user_filename
+                caller_info["user_line"] = user_frame.f_lineno
+                caller_info["user_function"] = user_frame.f_code.co_name
+                break
+            user_frame = user_frame.f_back
+
+        # Log the call with actual argument values and caller info
+        _log_api_call(full_path, args_info=args_dict, kwargs_info=kwargs_dict, caller_info=caller_info)
     except Exception:
         # If we can't get arg info, just log the signature without details
         _log_api_call(full_path)
@@ -438,8 +466,17 @@ def _install_trace_hook():
 # 🧹 Cleanup on Exit
 # =====================================================================
 def _save_on_exit():
-    """Print summary when the program exits"""
+    """Save execution trace and print summary when the program exits"""
     print(f"\n[⚙️ Ghost Engine] Logged {len(api_call_signatures)} unique API calls to {API_LOG_FILE}")
+
+    # Save execution trace to a separate JSON file
+    trace_file = API_LOG_FILE.replace('.api_calls.json', '.execution_trace.json')
+    try:
+        with open(trace_file, 'w', encoding='utf-8') as f:
+            json.dump(api_call_trace, f, indent=2, ensure_ascii=False)
+        print(f"[⚙️ Ghost Engine] Saved execution trace to {trace_file}")
+    except Exception as e:
+        print(f"⚠️ [API Log] Failed to save execution trace: {e}")
 
 atexit.register(_save_on_exit)
 

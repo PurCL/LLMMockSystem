@@ -4,3 +4,5 @@ resolved_versions.json
 generated_dockerfiles
 testscript/*
 fixed_requirements.txt
+resolution_report.txt
+result/

@@ -18,7 +18,7 @@ Flask-Themes2==1.0.1
 itsdangerous==2.2.0
 jaraco.functools==4.4.0
 Jinja2==3.1.6
-Js2Py==0.39
+Js2Py==0.74
 MarkupSafe==3.0.3
 more-itertools==10.8.0
 msgspec==0.20.0
