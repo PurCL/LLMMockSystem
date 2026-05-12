@@ -1532,10 +1532,7 @@ def main():
     # Define testscript_dir for cleanup purposes
     testscript_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "generated_test_scripts")
 
-    # Always perform validation, do not skip based on filename
-    skip_all_validation = False
-
-    if mode == 'real' and not skip_all_validation:
+    if mode == 'real':
         # Read requirements.txt and store all package names
         print("\n" + "="*50)
         print("📋 STEP 1: Reading requirements.txt and storing all package names")
@@ -1709,9 +1706,9 @@ def main():
     # =================================================================
     # 🧪 STEP 4.5: Script-based Version Validation (Real Mode Only)
     # =================================================================
-    if mode == 'real' and resolved_packages and not skip_all_validation:
+    if mode == 'real' and resolved_packages:
         print("\n" + "="*50)
-        print("🧪 STEP 4.5: Script-based Version Validation")
+        print("🧪 STEP 4.5: Script-based Version Validation & Filtering")
         print("="*50)
         print("This step validates package versions by:")
         print("  1. Using LLM to generate test scripts based on API logs")
@@ -1743,27 +1740,55 @@ def main():
                 max_retries=5  # Retry up to 5 times for inference failures
             )
 
-            # Load validated versions and replace resolved_packages
+            # -----------------------------------------------------------------
+            # 💡 NEW LOGIC: Extract inferred versions, update memory, delete validated.json
+            # -----------------------------------------------------------------
             with open(validated_output, 'r') as f:
                 validated_data = json.load(f)
 
             validated_packages = validated_data.get('resolved_packages', {})
+            validation_report = validated_data.get('validation_report', {})
+            packages_info = validation_report.get('packages', {})
+
             if validated_packages:
-                print("\n✅ Validation complete. Using validated versions for Dockerfile generation.")
+                print("\n✅ Validation complete. Updating packages and sorting by release date...")
                 # Update resolved_packages with validated versions
                 resolved_packages = validated_packages
 
-                # Delete intermediate resolved_versions.json file since we have validated_versions.json
-                intermediate_resolved_path = os.path.join(result_dir, "resolved_versions.json")
-                if os.path.exists(intermediate_resolved_path) and intermediate_resolved_path != validated_output:
-                    try:
-                        os.remove(intermediate_resolved_path)
-                        print(f"   🗑️  Removed intermediate file: {intermediate_resolved_path}")
-                    except Exception as e:
-                        print(f"   ⚠️ Warning: Could not remove intermediate file: {e}")
+                for pkg_name, enhanced_info in resolved_packages_enhanced.items():
+                    pkg_info = packages_info.get(pkg_name, {})
+                    status = pkg_info.get('status', 'unknown')
+                    
+                    final_versions = validated_packages.get(pkg_name, enhanced_info.get('versions', []))
+                    
+                    release_dates = enhanced_info.get('release_dates', {})
+                    final_versions.sort(key=lambda v: (
+                        release_dates.get(v) not in ("unknown", None, ""),
+                        release_dates.get(v) or ""
+                    ), reverse=True)
 
-                # Update config_output_path to use validated versions
-                config_output_path = validated_output
+                    enhanced_info['versions'] = final_versions
+                    enhanced_info['validation_status'] = status
+                    
+                    if status in ['validated_success', 'no_api_calls_kept_all']:
+                        enhanced_info['category'] = 'success'
+                    else:
+                        enhanced_info['category'] = 'failed'
+
+                # Immediately delete intermediate files including validated_versions.json
+                intermediate_files = [
+                    os.path.join(result_dir, "resolved_versions.json"),
+                    validated_output  # This is validated_versions.json
+                ]
+                print("\n🗑️  Cleaning up intermediate validation files...")
+                for tmp_file in intermediate_files:
+                    if os.path.exists(tmp_file):
+                        try:
+                            os.remove(tmp_file)
+                            print(f"   🗑️  Removed: {os.path.basename(tmp_file)}")
+                        except Exception as e:
+                            print(f"   ⚠️ Warning: Could not remove {os.path.basename(tmp_file)}: {e}")
+
             else:
                 print("\n⚠️ Validation produced no results. Using original resolved versions.")
 
@@ -1781,7 +1806,7 @@ def main():
     # =================================================================
     if mode == 'real':
         print("\n" + "="*50)
-        print("📊 Generating enhanced resolution report")
+        print("📊 Generating enhanced resolution report (Based on Inferred Packages)")
         print("="*50)
 
         # Get paths for trace files
@@ -1791,6 +1816,7 @@ def main():
         # Generate and save the enhanced report
         enhanced_report_path = "resolution_report.txt"
         try:
+            # resolved_packages_enhanced is already filtered above!
             save_enhanced_report(
                 resolved_packages_enhanced,
                 state_file,  # .api_calls.json
@@ -1810,7 +1836,7 @@ def main():
             traceback.print_exc()
 
     # Print summary
-    print("\n📊 Summary of resolved packages:")
+    print("\n📊 Summary of inferred packages for Docker builds:")
     total_versions_product = 1
     for pkg, versions in resolved_packages.items():
         num_versions = len(versions)
@@ -1826,7 +1852,7 @@ def main():
     # 🐳 LLM-Guided Dockerfile Generation with Build Testing
     # =================================================================
     print("\n" + "="*50)
-    print("🐳 STEP 5: LLM-Guided Dockerfile Generation")
+    print("🐳 STEP 5: LLM-Guided Dockerfile Generation (Based on Inferred Packages)")
     print("="*50)
 
     # Parse num_dockerfiles parameter
@@ -1840,6 +1866,7 @@ def main():
             num_dockerfiles_to_generate = 1
 
     # Generate Dockerfiles by testing different version combinations
+    # resolved_packages is already filtered!
     llm_guided_dockerfile_generation(
         resolved_packages,
         project_path=project_path,
@@ -1870,16 +1897,7 @@ def main():
         except Exception as e:
             print(f"   ⚠️ Warning: Failed to remove testscript directory: {e}")
 
-    # # Remove generated_dockerfiles directory
-    # dockerfiles_dir = os.path.join(base_dir, "generated_dockerfiles")
-    # if os.path.exists(dockerfiles_dir):
-    #     try:
-    #         shutil.rmtree(dockerfiles_dir)
-    #         print(f"   ✅ Removed intermediate directory: {dockerfiles_dir}")
-    #     except Exception as e:
-    #         print(f"   ⚠️ Warning: Failed to remove dockerfiles directory: {e}")
-
-    # 6.2: Generate final output files (only keep these two essential files)
+    # 6.2: Generate final output files 
     print("\n" + "="*50)
     print("📤 Generating Final Output Files")
     print("="*50)
@@ -1901,86 +1919,19 @@ def main():
     else:
         print(f"   ⚠️ Warning: Execution trace not found at {execution_trace_source}")
 
-    # Output File 2: Inferred Package Versions
-    # Extract only successfully inferred packages (exclude inference_failed cases)
-    inferred_versions_output = os.path.join(result_dir, "inferred_package_versions.json")
-
-    if mode == 'real' and os.path.exists(config_output_path):
-        try:
-            # Load the final validated versions
-            with open(config_output_path, 'r') as f:
-                final_data = json.load(f)
-
-            validation_report = final_data.get('validation_report', {})
-            packages_info = validation_report.get('packages', {})
-
-            # Filter to only include successfully inferred packages
-            successfully_inferred = {}
-            failed_packages = {}
-
-            for pkg_name, versions in resolved_packages.items():
-                pkg_info = packages_info.get(pkg_name, {})
-                status = pkg_info.get('status', 'unknown')
-
-                if status in ['validated_success', 'no_api_calls_kept_all']:
-                    # Successfully inferred
-                    successfully_inferred[pkg_name] = {
-                        "versions": versions,
-                        "status": status,
-                        "retry_count": pkg_info.get('retry_count', 0),
-                        "compatible_versions": pkg_info.get('compatible_versions', len(versions)),
-                        "candidate_versions": pkg_info.get('candidate_versions', len(versions))
-                    }
-                else:
-                    # Inference failed
-                    failed_packages[pkg_name] = {
-                        "status": status,
-                        "retry_count": pkg_info.get('retry_count', 0),
-                        "kept_version": versions[0] if versions else "unknown"
-                    }
-
-            # Create output data
-            inferred_output_data = {
-                "mode": mode,
-                "python_version": python_version,
-                "generated_at": final_data.get('validated_at', final_data.get('generated_at', 'unknown')),
-                "summary": {
-                    "total_packages": len(resolved_packages),
-                    "successfully_inferred": len(successfully_inferred),
-                    "inference_failed": len(failed_packages)
-                },
-                "successfully_inferred_packages": successfully_inferred,
-                "failed_packages": failed_packages
-            }
-
-            # Save to file
-            with open(inferred_versions_output, 'w') as f:
-                json.dump(inferred_output_data, f, indent=4)
-
-            print(f"   ✅ File 2: Inferred package versions → {inferred_versions_output}")
-            print(f"      Successfully inferred: {len(successfully_inferred)} packages")
-            print(f"      Inference failed: {len(failed_packages)} packages")
-
-            # Show file size
-            file_size = os.path.getsize(inferred_versions_output)
-            print(f"      Size: {file_size:,} bytes ({file_size / 1024:.1f} KB)")
-
-        except Exception as e:
-            print(f"   ⚠️ Warning: Failed to generate inferred versions file: {e}")
-            import traceback
-            traceback.print_exc()
-
+    # Note: Inferred package versions were already generated and saved in Step 4.5.
+    
     print("\n" + "="*50)
     print("✅ Final Output Summary")
     print("="*50)
     if mode == 'real':
-        # Determine the description based on whether validation was skipped
-        version_desc = "fixed package versions" if skip_all_validation else "validated package versions"
-        print(f"   📄 Output File 1: {config_output_path} ({version_desc})")
-        print(f"   📄 Output File 2: {execution_trace_output} (program execution trace)")
-        print(f"   📄 Output File 3: {inferred_versions_output} (successfully inferred packages)")
+        inferred_versions_output = os.path.join(result_dir, "inferred_package_versions.json")
+        print(f"   📄 Primary Output File: {inferred_versions_output} (successfully inferred packages)")
+        print(f"   📄 Trace Output File: {execution_trace_output} (program execution trace)")
+        print(f"   📄 Report Output File: resolution_report.txt (human-readable report)")
+        print(f"   🐳 Dockerfiles Output: ./generated_dockerfiles/ (Based strictly on inferred packages)")
     else:
-        print(f"   📄 Output File 1: {config_output_path} (resolved package versions)")
+        print(f"   📄 Output File: {config_output_path} (resolved package versions)")
     print("="*50)
 
 
