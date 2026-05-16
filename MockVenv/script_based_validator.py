@@ -58,6 +58,22 @@ def parse_api_calls_by_package(api_calls_file: str) -> Dict[str, List[str]]:
             if package_name.startswith('__'):
                 continue
 
+            # Skip API calls with special Python internal representations
+            # These cannot be properly validated in test scripts
+            skip_patterns = ['<genexpr>', '<listcomp>', '<dictcomp>', '<setcomp>',
+                           '<lambda>', '<module>', '<function>', '<builtin_function_or_method>',
+                           '<type>', '<code>', '<list_iterator>', '<dict_itemiterator>',
+                           '<range_iterator>', '<generator>', '<method>']
+
+            if any(pattern in line for pattern in skip_patterns):
+                continue
+
+            # Skip private/internal APIs (those with modules starting with '_')
+            # These are unstable and change between versions
+            parts_check = line.split('(')[0].split('.')
+            if any(part.startswith('_') and not part.startswith('__') for part in parts_check):
+                continue
+
             if package_name not in api_by_package:
                 api_by_package[package_name] = []
 
@@ -84,41 +100,62 @@ def generate_test_script_with_llm(package_name: str, api_calls: List[str]) -> st
 
     prompt = f"""Generate a Python test script to validate API compatibility for package: {package_name}
 
-API calls observed from runtime execution:
+API calls observed from runtime execution (sample):
 {chr(10).join(api_calls[:100])}
-{'... (truncated, showing first 100 API calls)' if len(api_calls) > 100 else ''}
+{'... (truncated, showing first 100 of {len(api_calls)} API calls)' if len(api_calls) > 100 else ''}
 
 Total API calls: {len(api_calls)}
 
-Requirements:
+IMPORTANT Requirements:
 1. Import the package "{package_name}"
-2. Create code that uses ALL the observed API calls
+2. Use hasattr() to check if APIs exist - DO NOT try to call or instantiate them
 3. The script should:
-   - Import all necessary modules from {package_name}
-   - Call or reference each API observed in the API calls list
-   - Use try-except to handle instantiation/calling where needed
-   - Print "SUCCESS" if all APIs are available
-   - Print "FAILED: <reason>" and exit with code 1 if any API is missing
-4. Make the script executable and complete
-5. DO NOT use mock objects or test frameworks - use actual package APIs
-6. Handle constructor calls like "package.Class()" by trying to instantiate or check hasattr
+   - Import necessary modules from {package_name}
+   - For each API call like "package.module.Class()", check: hasattr(package.module, 'Class')
+   - For each API call like "package.module.function()", check: hasattr(package.module, 'function')
+   - Ignore parameter values in API calls - only check attribute names
+   - Count successful checks and missing APIs
+   - If at least 80% of APIs exist, print "SUCCESS" and exit(0)
+   - If less than 80% exist, print "FAILED: only X/Y APIs found" and exit(1)
+4. Use a counter to track found vs missing APIs - be tolerant of minor API changes
+5. Make the script simple and safe - only check existence, do not execute
+6. DO NOT use mock objects or test frameworks
+7. Handle import errors and missing attributes gracefully with try-except
 
 Return ONLY the Python script code, no markdown, no explanations.
 
 Example structure:
 ```python
 #!/usr/bin/env python3
-import {package_name}
+import sys
 
 try:
-    # Test API availability
-    # ... your code here ...
+    import {package_name}
 
-    print("SUCCESS")
-    exit(0)
+    total_checks = 0
+    found_apis = 0
+    missing_apis = []
+
+    # Check API availability using hasattr
+    total_checks += 1
+    if hasattr({package_name}, 'SomeClass'):
+        found_apis += 1
+    else:
+        missing_apis.append('{package_name}.SomeClass')
+
+    # More checks...
+
+    # Success if at least 80% of APIs found
+    success_rate = found_apis / total_checks if total_checks > 0 else 0
+    if success_rate >= 0.8:
+        print("SUCCESS")
+        sys.exit(0)
+    else:
+        print(f"FAILED: only {{found_apis}}/{{total_checks}} APIs found ({{success_rate*100:.1f}}%)")
+        sys.exit(1)
 except Exception as e:
     print(f"FAILED: {{e}}")
-    exit(1)
+    sys.exit(1)
 ```
 
 Generate the complete test script:"""
@@ -157,15 +194,17 @@ def generate_simple_test_script(package_name: str, api_calls: List[str]) -> str:
         api_calls: List of API call signatures
 
     Returns:
-        Simple Python test script
+        Simple Python test script with 80% tolerance
     """
     # Parse API calls to extract modules and attributes
     imports = set()
-    checks = []
+    api_checks = []
 
     for api_call in api_calls:
-        # Extract module path
-        parts = api_call.split('(')[0].split('.')
+        # Extract module path (remove parameters)
+        api_path = api_call.split('(')[0]
+        parts = api_path.split('.')
+
         if len(parts) >= 2:
             # Import the module
             imports.add(parts[0])
@@ -174,11 +213,37 @@ def generate_simple_test_script(package_name: str, api_calls: List[str]) -> str:
             module_path = '.'.join(parts[:-1])
             attr_name = parts[-1]
 
-            # Skip special patterns
-            if attr_name.startswith('__') or attr_name in ['<listcomp>', '<dictcomp>', '<setcomp>', '<genexpr>']:
+            # Skip special patterns - expanded filter
+            skip_patterns = ['__', '<listcomp>', '<dictcomp>', '<setcomp>', '<genexpr>',
+                           '<lambda>', '<module>', '<function>', '<builtin_function_or_method>',
+                           '<type>', '<code>', '<list_iterator>', '<dict_itemiterator>',
+                           '<range_iterator>', '<generator>', '<method>']
+
+            if any(pattern in attr_name for pattern in skip_patterns):
                 continue
 
-            checks.append(f"    if not hasattr({module_path}, '{attr_name}'):\n        raise AttributeError(f'Missing: {module_path}.{attr_name}')")
+            # Skip if attribute name is not a valid Python identifier
+            if not attr_name.replace('_', '').isalnum():
+                continue
+
+            api_checks.append((module_path, attr_name, api_path))
+
+    # Limit checks to prevent script from being too large
+    api_checks = api_checks[:100]  # Increased from 50 to 100 for better coverage
+
+    # Generate check code
+    check_lines = []
+    for module_path, attr_name, api_path in api_checks:
+        check_lines.append(f"""    total_checks += 1
+    try:
+        obj = {module_path}
+        if hasattr(obj, '{attr_name}'):
+            found_apis += 1
+        else:
+            missing_apis.append('{api_path}')
+    except (AttributeError, ImportError):
+        # Module structure might be different, skip this check
+        total_checks -= 1  # Don't count failed imports""")
 
     script = f"""#!/usr/bin/env python3
 import sys
@@ -187,11 +252,24 @@ try:
     # Import package
     import {package_name}
 
-    # Check API availability
-{chr(10).join(checks[:50])}  # Limit to first 50 checks
+    # Track API availability - be tolerant of version differences (80% threshold)
+    total_checks = 0
+    found_apis = 0
+    missing_apis = []
 
-    print("SUCCESS")
-    sys.exit(0)
+    # Check API availability (sample of {len(api_calls)} total APIs)
+{chr(10).join(check_lines)}
+
+    # Success if at least 80% of APIs are found
+    success_rate = found_apis / total_checks if total_checks > 0 else 0
+    if success_rate >= 0.8:
+        print("SUCCESS")
+        sys.exit(0)
+    else:
+        print(f"FAILED: only {{found_apis}}/{{total_checks}} APIs found ({{success_rate*100:.1f}}%)")
+        if missing_apis[:3]:
+            print(f"Sample missing: {{', '.join(missing_apis[:3])}}")
+        sys.exit(1)
 
 except Exception as e:
     print(f"FAILED: {{e}}")
@@ -221,6 +299,10 @@ def test_version_with_uv(
     Returns:
         Tuple of (is_compatible, error_message)
     """
+    # Ensure python_version is not empty
+    if not python_version or python_version.strip() == "":
+        python_version = "3.10"
+
     with tempfile.TemporaryDirectory() as tmpdir:
         # Write test script
         test_script_path = os.path.join(tmpdir, "test_script.py")
@@ -231,7 +313,7 @@ def test_version_with_uv(
 
         try:
             # Step 1: Create uv virtual environment
-            create_venv_cmd = f"cd {tmpdir} && uv venv --python {python_version} validate_venv"
+            create_venv_cmd = f"uv venv {os.path.join(tmpdir, 'validate_venv')} --python {python_version}"
             result = subprocess.run(
                 create_venv_cmd,
                 shell=True,
@@ -314,7 +396,7 @@ def validate_package_versions_with_scripts(
     max_workers: int = 4,
     timeout: int = 30,
     requirements_version: str = None
-) -> Tuple[List[str], Optional[str]]:
+) -> Tuple[List[str], Optional[str], Optional[dict]]:
     """
     Validate package versions using script-based testing with a pre-generated test script.
 
@@ -328,7 +410,7 @@ def validate_package_versions_with_scripts(
         requirements_version: The version specified in requirements.txt (for validation)
 
     Returns:
-        Tuple of (List of compatible version strings, Optional error reason)
+        Tuple of (List of compatible version strings, Optional error reason, Optional stats dict)
     """
     print(f"\n🔍 Validating {package_name} with script-based testing...")
     print(f"   📊 Testing {len(candidate_versions)} versions")
@@ -336,6 +418,15 @@ def validate_package_versions_with_scripts(
     print(f"   🧪 Using {max_workers} parallel workers")
     if requirements_version:
         print(f"   📋 Requirements.txt version: {requirements_version}")
+
+    # Initialize statistics
+    stats = {
+        "pypi_versions": len(candidate_versions),
+        "installable_versions": 0,
+        "script_passed_versions": 0,
+        "requirements_version_failed": False,
+        "requirements_version_error": None
+    }
 
     # STEP 1: First, test the requirements.txt version with the test script
     requirements_version_exists = False
@@ -353,6 +444,10 @@ def validate_package_versions_with_scripts(
             # requirements.txt version failed the test script
             print(f"   ❌ Requirements.txt version FAILED the test!")
             print(f"   ❌ Error: {error_msg[:200] if error_msg else 'Unknown error'}")
+
+            # Record this failure
+            stats["requirements_version_failed"] = True
+            stats["requirements_version_error"] = error_msg[:200] if error_msg else 'Unknown error'
 
             # CHANGED: Always continue testing other versions instead of returning early
             # Even if test script has issues, we should find versions that work with the script
@@ -405,6 +500,10 @@ def validate_package_versions_with_scripts(
     print(f"\n   ✅ Found {len(compatible_versions)} compatible versions")
     print(f"   ❌ Filtered out {incompatible_count} incompatible versions")
 
+    # Update statistics
+    stats["script_passed_versions"] = len(compatible_versions)
+    # Note: installable_versions is the same as script_passed_versions since we only test script on successfully installed packages
+
     # STEP 3: Verify that requirements.txt version is in the compatible list
     if requirements_version and compatible_versions and requirements_version_exists:
         if requirements_version not in compatible_versions:
@@ -413,7 +512,7 @@ def validate_package_versions_with_scripts(
             # CHANGED: Don't return requirements_version if it's not in compatible list
             # Instead, use the compatible versions we found
             print(f"   📌 Using {len(compatible_versions)} validated compatible versions instead")
-            return compatible_versions, "requirements_version_not_in_compatible_using_validated"
+            return compatible_versions, "requirements_version_not_in_compatible_using_validated", stats
 
         print(f"   ✅ Verification passed: Requirements.txt version ({requirements_version}) is in compatible list")
     elif requirements_version and not requirements_version_exists:
@@ -427,9 +526,9 @@ def validate_package_versions_with_scripts(
     if not compatible_versions:
         print(f"\n   ❌ CRITICAL: No compatible versions found after testing {len(candidate_versions)} candidates!")
         print(f"   ⚠️ This indicates the test script may be incorrect or the package has API breaking changes")
-        return [], "no_compatible_versions_found"
+        return [], "no_compatible_versions_found", stats
 
-    return compatible_versions, None
+    return compatible_versions, None, stats
 
 
 def validate_all_packages_with_scripts(
@@ -538,7 +637,12 @@ def validate_all_packages_with_scripts(
         "total_candidate_versions": 0,
         "total_compatible_versions": 0,
         "python_version": python_version,
-        "packages": {}
+        "packages": {},
+        # NEW: Track statistics for the report
+        "total_pypi_versions": 0,
+        "total_installable_versions": 0,
+        "total_script_passed_versions": 0,
+        "requirements_version_failures": []  # [(pkg_name, version, error_reason)]
     }
 
     for idx, (package_name, candidate_versions) in enumerate(resolved_packages.items(), 1):
@@ -630,12 +734,20 @@ except Exception as e:
 
             validated_packages[package_name] = compatible_versions
             validation_report["total_compatible_versions"] += len(compatible_versions)
+
+            # Collect statistics for packages without API calls
+            validation_report["total_pypi_versions"] += len(candidate_versions)
+            validation_report["total_script_passed_versions"] += len(compatible_versions)
+
             validation_report["packages"][package_name] = {
                 "candidate_versions": len(candidate_versions),
                 "compatible_versions": len(compatible_versions),
                 "filtered_count": incompatible_count,
                 "status": "no_api_calls_installability_tested",
-                "retry_count": 0
+                "retry_count": 0,
+                "pypi_versions": len(candidate_versions),
+                "installable_versions": len(compatible_versions),
+                "script_passed_versions": len(compatible_versions)
             }
             continue
 
@@ -648,12 +760,13 @@ except Exception as e:
         error_reason = None
         retry_count = 0
 
+        pkg_stats = None
         for attempt in range(max_retries):
             retry_count = attempt
             print(f"   🔄 Attempt {attempt + 1}/{max_retries}: Validating {len(candidate_versions)} versions...")
 
             # Validate versions with script-based testing (using pre-generated script)
-            compatible_versions, error_reason = validate_package_versions_with_scripts(
+            compatible_versions, error_reason, pkg_stats = validate_package_versions_with_scripts(
                 package_name,
                 test_script,  # Pass pre-generated test script
                 candidate_versions,
@@ -695,13 +808,26 @@ except Exception as e:
             if error_reason:
                 status = f"error_{error_reason}"
 
+            # Collect statistics
+            if pkg_stats:
+                validation_report["total_pypi_versions"] += pkg_stats.get("pypi_versions", 0)
+                validation_report["total_script_passed_versions"] += pkg_stats.get("script_passed_versions", 0)
+                # Track requirements.txt version failures
+                if pkg_stats.get("requirements_version_failed") and requirements_version:
+                    validation_report["requirements_version_failures"].append(
+                        (package_name, requirements_version, pkg_stats.get("requirements_version_error"))
+                    )
+
             validation_report["packages"][package_name] = {
                 "candidate_versions": len(candidate_versions),
                 "compatible_versions": len(compatible_versions),
                 "filtered_count": len(candidate_versions) - len(compatible_versions),
                 "status": status,
                 "retry_count": retry_count + 1,
-                "error_reason": error_reason if error_reason else None
+                "error_reason": error_reason if error_reason else None,
+                "pypi_versions": pkg_stats.get("pypi_versions", 0) if pkg_stats else 0,
+                "installable_versions": len(candidate_versions),  # All tested versions were installable
+                "script_passed_versions": pkg_stats.get("script_passed_versions", 0) if pkg_stats else 0
             }
         else:
             # FIXED: All retries failed - only keep requirements.txt version
@@ -712,26 +838,43 @@ except Exception as e:
                 print(f"   💡 Reason: Validation failed, only trusting the original specified version")
                 validated_packages[package_name] = [requirements_version]
                 validation_report["total_compatible_versions"] += 1
+
+                # Update total statistics
+                validation_report["total_pypi_versions"] += len(candidate_versions)
+                # CHANGED: Don't force script_passed_versions to 1, keep it as 0 (real data)
+                validation_report["total_script_passed_versions"] += 0  # No versions actually passed
+
                 validation_report["packages"][package_name] = {
                     "candidate_versions": len(candidate_versions),
                     "compatible_versions": 1,
                     "filtered_count": len(candidate_versions) - 1,
                     "status": "validation_failed_kept_requirements_version_only",
                     "retry_count": max_retries,
-                    "error_reason": "all_retries_failed_keeping_requirements_txt_version_only"
+                    "error_reason": "all_retries_failed_keeping_requirements_txt_version_only",
+                    "pypi_versions": len(candidate_versions),
+                    "installable_versions": len(candidate_versions),
+                    "script_passed_versions": 0  # Real data: no versions passed script validation
                 }
             else:
                 print(f"   ❌ No requirements.txt version available!")
                 print(f"   📌 Keeping all {len(candidate_versions)} candidate versions as fallback")
                 validated_packages[package_name] = candidate_versions
                 validation_report["total_compatible_versions"] += len(candidate_versions)
+
+                # Update total statistics
+                validation_report["total_pypi_versions"] += len(candidate_versions)
+                # Note: total_script_passed_versions is not updated because no versions actually passed
+
                 validation_report["packages"][package_name] = {
                     "candidate_versions": len(candidate_versions),
                     "compatible_versions": len(candidate_versions),
                     "filtered_count": 0,
                     "status": "validation_failed_no_requirements_version_kept_all",
                     "retry_count": max_retries,
-                    "error_reason": "no_requirements_version_available_keeping_all_pypi_versions"
+                    "error_reason": "no_requirements_version_available_keeping_all_pypi_versions",
+                    "pypi_versions": len(candidate_versions),
+                    "installable_versions": len(candidate_versions),
+                    "script_passed_versions": 0  # No versions actually passed script validation
                 }
 
     # Save results

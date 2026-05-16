@@ -67,7 +67,7 @@ def main():
         else:
             print(f"⚠️ Warning: {whitelist_file} not found. Operating without a whitelist!")
 
-        packages_to_install = ["claude-agent-sdk", "psycopg2-binary"]
+        packages_to_install = ["claude-agent-sdk"]
 
         if req_file and os.path.isfile(req_file):
             print(f"🔍 3. MOCK MODE: Analyzing {req_file} against the whitelist...")

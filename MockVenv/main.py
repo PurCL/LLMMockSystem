@@ -20,6 +20,8 @@ import argparse
 import subprocess
 import json
 import re
+from datetime import datetime
+import shutil
 
 
 def reset_environment(requirements_path, mode='mock', python_version=None):
@@ -101,6 +103,17 @@ def fix_environment(requirements_path, mode, project_path, exploit_scripts):
         print(f"❌ Error: Requirements file not found: {requirements_path}")
         sys.exit(1)
 
+    # Check if user is mistakenly using fixed_requirements.txt as input
+    requirements_basename = os.path.basename(requirements_path)
+    if requirements_basename == "fixed_requirements.txt":
+        print(f"⚠️ WARNING: You are using 'fixed_requirements.txt' as input!")
+        print(f"💡 This will cause circular references. You should use the ORIGINAL requirements.txt instead.")
+        print(f"💡 Example: --requirements requirements.txt (not fixed_requirements.txt)")
+        user_input = input("\n❓ Do you want to continue anyway? (yes/no): ").strip().lower()
+        if user_input not in ['yes', 'y']:
+            print("❌ Aborted by user")
+            sys.exit(1)
+
     if not os.path.exists(project_path):
         print(f"❌ Error: Project path not found: {project_path}")
         sys.exit(1)
@@ -111,6 +124,55 @@ def fix_environment(requirements_path, mode, project_path, exploit_scripts):
 
     requirements_path = os.path.abspath(requirements_path)
     project_path = os.path.abspath(project_path)
+
+    # Check if fix_log directory exists
+    fix_log_dir = os.path.join(os.getcwd(), "fix_log")
+    previous_fix_attempts = ""
+
+    if os.path.exists(fix_log_dir) and os.path.isdir(fix_log_dir):
+        # Check if there are any log files in the directory
+        log_files = [f for f in os.listdir(fix_log_dir) if f.endswith('.txt') or f.endswith('.log') or f.endswith('.md')]
+
+        if log_files:
+            print("\n" + "=" * 60)
+            print("📂 Found existing fix_log directory with previous attempts")
+            print("=" * 60)
+            print(f"Found {len(log_files)} previous fix attempt(s)")
+
+            # Ask user if they want to clear the log
+            while True:
+                user_input = input("\n❓ Do you want to clear the fix log history? (yes/no): ").strip().lower()
+                if user_input in ['yes', 'y']:
+                    print("🧹 Clearing fix_log directory...")
+                    shutil.rmtree(fix_log_dir)
+                    os.makedirs(fix_log_dir, exist_ok=True)
+                    print("✅ Fix log cleared")
+                    break
+                elif user_input in ['no', 'n']:
+                    print("📖 Reading previous fix attempts to avoid rollback...")
+
+                    # Read all log files and concatenate them
+                    all_logs = []
+                    for log_file in sorted(log_files):
+                        log_path = os.path.join(fix_log_dir, log_file)
+                        try:
+                            with open(log_path, 'r', encoding='utf-8') as f:
+                                log_content = f.read()
+                                all_logs.append(f"## Previous Fix Attempt: {log_file}\n\n{log_content}\n")
+                            print(f"  ✓ Loaded: {log_file}")
+                        except Exception as e:
+                            print(f"  ⚠️ Failed to read {log_file}: {e}")
+
+                    if all_logs:
+                        previous_fix_attempts = "\n".join(all_logs)
+                        print(f"✅ Loaded {len(all_logs)} previous fix attempt(s)")
+                    break
+                else:
+                    print("❌ Please enter 'yes' or 'no'")
+    else:
+        # Create fix_log directory if it doesn't exist
+        os.makedirs(fix_log_dir, exist_ok=True)
+        print(f"✅ Created fix_log directory: {fix_log_dir}")
 
     print(f"📋 Requirements file: {requirements_path}")
     print(f"📂 Project path: {project_path}")
@@ -275,32 +337,57 @@ The following trace shows which APIs were ACTUALLY called during failed executio
 ```
 """
 
+    # Add previous fix attempts if available
+    if previous_fix_attempts:
+        analysis_prompt += f"""
+
+### 5. Previous Fix Attempts
+**IMPORTANT**: The following are previous fix attempts that were already tried.
+Please carefully review these attempts and DO NOT suggest the same fixes again.
+Learn from what has been tried before and avoid rollback.
+
+{previous_fix_attempts}
+"""
+
     analysis_prompt += """
 
 ## Analysis Task
 
-### Step 1: Identify the Expected Exploit Execution Path
+### Step 1: Identify the Error Type
+First, determine if this is a ModuleNotFoundError (missing package) or a version incompatibility issue:
+- **ModuleNotFoundError**: A required Python module/package is completely missing and needs to be ADDED
+- **Version Incompatibility**: An existing package has the wrong version and needs to be UPDATED
+
+### Step 2: For ModuleNotFoundError - Identify Missing Packages
+If the error is "ModuleNotFoundError: No module named 'xxx'":
+- Extract the missing module name (e.g., 'pkg_resources', 'setuptools', etc.)
+- Determine the PyPI package name that provides this module
+- Recommend adding this NEW package to requirements.txt (DO NOT modify existing package versions)
+
+### Step 3: For Version Issues - Identify the Expected Exploit Execution Path
 Based on the project source code and exploit scripts, trace the COMPLETE execution path that would lead to successful exploit:
 - Which API endpoints are called?
 - Which functions are invoked in sequence?
 - What key operations should occur (e.g., query parsing, sandbox escape, command execution)?
 - Which package versions/features are required at each step?
 
-### Step 2: Compare with Actual Failed Execution Path
+### Step 4: Compare with Actual Failed Execution Path
 Analyze the .api_calls.json trace to identify:
 - Where did the execution path diverge from the expected path?
 - Which expected API calls are MISSING from the trace?
 - Which APIs behaved differently than expected?
 - Are there error indicators in the trace?
 
-### Step 3: Identify Package Version Root Causes
+### Step 5: Identify Package Version Root Causes
 For each divergence point, determine:
 - Which package is responsible for the missing/changed behavior?
 - What specific version introduced or removed the required feature?
 - Which EXACT version would restore the expected behavior?
 
-### Step 4: Generate Recommendations
-Provide SPECIFIC package versions that would fix each identified issue.
+### Step 6: Generate Recommendations
+Provide SPECIFIC recommendations based on error type:
+- For ModuleNotFoundError: Add NEW packages to requirements.txt
+- For version issues: Update existing package versions
 
 ## Output Format
 
@@ -308,7 +395,8 @@ You MUST provide your response in the following EXACT JSON format (no markdown, 
 
 ```json
 {
-  "summary": "Brief overview of the execution path divergence",
+  "error_type": "ModuleNotFoundError or VersionIncompatibility",
+  "summary": "Brief overview of the error or execution path divergence",
   "expected_exploit_path": [
     "Step 1: Description of expected execution",
     "Step 2: Next expected step",
@@ -330,27 +418,27 @@ You MUST provide your response in the following EXACT JSON format (no markdown, 
   "packages": [
     {
       "name": "package_name",
-      "current_version": "current version from requirements.txt",
+      "current_version": "current version from requirements.txt OR null if not installed",
       "recommended_version": "specific version that would work (EXACT version number)",
-      "issue": "what's wrong with current version (be specific about API changes)",
-      "reason": "why this version would fix the issue (explain how it enables the expected path)",
+      "action": "add or update",
+      "issue": "what's wrong (missing package or wrong version - be specific)",
+      "reason": "why this version/package would fix the issue",
       "evidence_from_trace": "specific evidence from .api_calls.json or missing calls"
     }
   ],
-  "root_cause": "Detailed explanation of why the exploit failed (focus on version-specific changes)",
+  "root_cause": "Detailed explanation of why the exploit failed",
   "recommended_actions": [
-    "Specific action 1 with exact version numbers",
+    "Specific action 1 with exact version numbers or package names",
     "Specific action 2"
   ]
 }
 ```
 
 ## Important Constraints
-- **CRITICAL**: Analyze the execution PATH, not just individual APIs
-- Compare expected vs actual execution flow systematically
-- Focus ONLY on package version problems that affect the execution path
+- **CRITICAL**: Distinguish between ModuleNotFoundError (add new package) and version issues (update existing package)
+- For ModuleNotFoundError: Set "action": "add" and "current_version": null
+- For version issues: Set "action": "update" and provide current version
 - Provide EXACT version numbers (e.g., "5.2" not ">=5.0" or "older version")
-- For each recommended version, explain HOW it fixes the path divergence
 - Use evidence from the API trace to support your analysis
 - If the trace is empty or minimal, it indicates early execution failure
 - MUST return valid JSON format as shown above
@@ -468,7 +556,7 @@ You MUST return ONLY valid JSON format without any markdown or additional text."
                             pkg_name_mapping[normalized] = pkg_name
                             pkg_name_mapping[pkg_name.lower().replace('-', '_')] = pkg_name
 
-                # Update with recommended versions
+                # Update with recommended versions or add new packages
                 updated_reqs = original_reqs.copy()
                 changes_made = []
 
@@ -476,6 +564,7 @@ You MUST return ONLY valid JSON format without any markdown or additional text."
                     pkg_name = package['name']
                     recommended_ver = package['recommended_version']
                     current_ver = package.get('current_version', 'unknown')
+                    action = package.get('action', 'update')  # Default to 'update' for backward compatibility
 
                     # Try to resolve the package name using multiple strategies
                     original_pkg_name = None
@@ -501,18 +590,45 @@ You MUST return ONLY valid JSON format without any markdown or additional text."
                             if pypi_normalized in pkg_name_mapping:
                                 original_pkg_name = pkg_name_mapping[pypi_normalized]
                                 print(f"  🗺️ Resolved import name '{pkg_name}' → PyPI name '{pypi_name}'")
+                            else:
+                                # If not in requirements, use the PyPI name for adding
+                                if action == 'add':
+                                    original_pkg_name = pypi_name
+                                    print(f"  🗺️ Resolved import name '{pkg_name}' → PyPI name '{pypi_name}' (will be added)")
 
                     # Strategy 4: Exact match (case-sensitive fallback)
                     if not original_pkg_name and pkg_name in original_reqs:
                         original_pkg_name = pkg_name
 
+                    # Strategy 5: If action is 'add' and package not found, use pkg_name as-is
+                    if not original_pkg_name and action == 'add':
+                        original_pkg_name = pkg_name
+
                     if original_pkg_name:
-                        # Use the original case from requirements.txt
-                        updated_reqs[original_pkg_name] = recommended_ver
-                        changes_made.append(f"  ✓ {original_pkg_name}: {current_ver} → {recommended_ver}")
-                        print(f"  ✓ {original_pkg_name}: {current_ver} → {recommended_ver}")
+                        if action == 'add':
+                            # Add new package
+                            if original_pkg_name in updated_reqs:
+                                # Package already exists - check if version needs updating
+                                if updated_reqs[original_pkg_name] != recommended_ver:
+                                    print(f"  ⚠️ Package '{original_pkg_name}' already exists in requirements.txt, updating version: {updated_reqs[original_pkg_name]} → {recommended_ver}")
+                                    changes_made.append(f"  ✓ {original_pkg_name}: {updated_reqs[original_pkg_name]} → {recommended_ver} (updated)")
+                                    updated_reqs[original_pkg_name] = recommended_ver
+                                else:
+                                    print(f"  ℹ️ Package '{original_pkg_name}' already exists with correct version {recommended_ver}, skipping")
+                            else:
+                                changes_made.append(f"  ✓ {original_pkg_name}: ADDED → {recommended_ver}")
+                                updated_reqs[original_pkg_name] = recommended_ver
+                                print(f"  ✓ {original_pkg_name}: ADDED with version {recommended_ver}")
+                        else:
+                            # Update existing package
+                            updated_reqs[original_pkg_name] = recommended_ver
+                            changes_made.append(f"  ✓ {original_pkg_name}: {current_ver} → {recommended_ver}")
+                            print(f"  ✓ {original_pkg_name}: {current_ver} → {recommended_ver}")
                     else:
-                        print(f"  ⚠️ Warning: Package '{pkg_name}' not found in original requirements.txt")
+                        if action == 'add':
+                            print(f"  ⚠️ Warning: Could not resolve package name '{pkg_name}' for adding")
+                        else:
+                            print(f"  ⚠️ Warning: Package '{pkg_name}' not found in original requirements.txt")
 
                 # Generate new requirements.txt content
                 new_requirements = []
@@ -524,21 +640,106 @@ You MUST return ONLY valid JSON format without any markdown or additional text."
 
                 new_requirements_content = '\n'.join(new_requirements)
 
-                # Save new requirements.txt to project root directory
-                new_requirements_path = os.path.join(os.getcwd(), "fixed_requirements.txt")
-                with open(new_requirements_path, 'w', encoding='utf-8') as f:
-                    f.write("# Fixed requirements.txt generated by MockVenv\n")
-                    f.write("# Original file: " + requirements_path + "\n")
-                    f.write("# Changes made:\n")
-                    for change in changes_made:
-                        f.write("#   " + change + "\n")
-                    f.write("\n")
-                    f.write(new_requirements_content)
+                # Check if any changes were actually made
+                if not changes_made:
+                    print("\n⚠️ No changes were made to requirements.txt - all packages already have the recommended versions.")
+                    print(f"💡 Hint: The input file '{requirements_path}' may already contain the correct versions.")
+                    print(f"💡 If you're experiencing issues, check if you're using the correct input requirements.txt file.")
+                else:
+                    # Save new requirements.txt to project root directory
+                    new_requirements_path = os.path.join(os.getcwd(), "fixed_requirements.txt")
+                    with open(new_requirements_path, 'w', encoding='utf-8') as f:
+                        f.write("# Fixed requirements.txt generated by MockVenv\n")
+                        f.write("# Original file: " + requirements_path + "\n")
+                        f.write("# Changes made:\n")
+                        for change in changes_made:
+                            f.write("#   " + change + "\n")
+                        f.write("\n")
+                        f.write(new_requirements_content)
 
-                print(f"\n✅ New requirements.txt saved to: {new_requirements_path}")
-                print(f"\n📋 Summary of changes:")
-                for change in changes_made:
-                    print(change)
+                    print(f"\n✅ New requirements.txt saved to: {new_requirements_path}")
+                    print(f"\n📋 Summary of changes:")
+                    for change in changes_made:
+                        print(change)
+
+                # Save fix log with timestamp
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                log_filename = f"fix_attempt_{timestamp}.md"
+                log_path = os.path.join(fix_log_dir, log_filename)
+
+                print(f"\n📝 Saving fix attempt log...")
+                with open(log_path, 'w', encoding='utf-8') as f:
+                    f.write(f"# Fix Attempt Log - {timestamp}\n\n")
+                    f.write(f"**Timestamp**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                    f.write("## Summary\n\n")
+                    f.write(f"{analysis_data.get('summary', 'No summary available')}\n\n")
+
+                    f.write("## Error Type\n\n")
+                    f.write(f"{analysis_data.get('error_type', 'Unknown')}\n\n")
+
+                    f.write("## Root Cause\n\n")
+                    f.write(f"{analysis_data.get('root_cause', 'No root cause identified')}\n\n")
+
+                    f.write("## Requirements.txt Modifications\n\n")
+                    if changes_made:
+                        f.write("The following changes were made to requirements.txt:\n\n")
+                        for change in changes_made:
+                            f.write(f"- {change.strip()}\n")
+                        f.write("\n")
+                    else:
+                        f.write("No changes were made to requirements.txt.\n\n")
+
+                    f.write("## Package Details and Rationale\n\n")
+                    if analysis_data.get('packages'):
+                        for package in analysis_data['packages']:
+                            f.write(f"### Package: {package['name']}\n\n")
+                            f.write(f"- **Action**: {package.get('action', 'update')}\n")
+                            f.write(f"- **Current Version**: {package.get('current_version', 'N/A')}\n")
+                            f.write(f"- **Recommended Version**: {package['recommended_version']}\n")
+                            f.write(f"- **Issue**: {package['issue']}\n")
+                            f.write(f"- **Reason**: {package['reason']}\n")
+                            if package.get('evidence_from_trace'):
+                                f.write(f"- **Evidence**: {package['evidence_from_trace']}\n")
+                            f.write("\n")
+                    else:
+                        f.write("No package modifications were recommended.\n\n")
+
+                    f.write("## Recommended Actions\n\n")
+                    if analysis_data.get('recommended_actions'):
+                        for idx, action in enumerate(analysis_data['recommended_actions'], 1):
+                            f.write(f"{idx}. {action}\n")
+                        f.write("\n")
+                    else:
+                        f.write("No specific actions recommended.\n\n")
+
+                    f.write("## Expected vs Actual Execution Path\n\n")
+                    if analysis_data.get('expected_exploit_path'):
+                        f.write("### Expected Exploit Path\n\n")
+                        for idx, step in enumerate(analysis_data['expected_exploit_path'], 1):
+                            f.write(f"{idx}. {step}\n")
+                        f.write("\n")
+
+                    if analysis_data.get('actual_execution_path'):
+                        f.write("### Actual Execution Path\n\n")
+                        for idx, step in enumerate(analysis_data['actual_execution_path'], 1):
+                            f.write(f"{idx}. {step}\n")
+                        f.write("\n")
+
+                    if analysis_data.get('path_divergence_points'):
+                        f.write("### Path Divergence Points\n\n")
+                        for idx, divergence in enumerate(analysis_data['path_divergence_points'], 1):
+                            f.write(f"#### Divergence {idx}\n\n")
+                            f.write(f"- **Step**: {divergence.get('step', 'N/A')}\n")
+                            f.write(f"- **Expected**: {divergence.get('expected', 'N/A')}\n")
+                            f.write(f"- **Actual**: {divergence.get('actual', 'N/A')}\n")
+                            f.write(f"- **Related Package**: {divergence.get('related_package', 'N/A')}\n")
+                            f.write("\n")
+
+                    f.write("---\n\n")
+                    f.write("*This log was automatically generated by MockVenv fix mode.*\n")
+
+                print(f"✅ Fix attempt log saved to: {log_path}")
+
             else:
                 print("\n⚠️ No package version issues identified. No new requirements.txt generated.")
 

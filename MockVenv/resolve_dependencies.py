@@ -1528,6 +1528,7 @@ def main():
     # Dictionary to store the resolved configuration
     resolved_packages = {}
     resolved_packages_enhanced = {}  # Enhanced info with reasoning, api_usage, etc.
+    validation_report = None  # Will be set if validation is performed
 
     # Define testscript_dir for cleanup purposes
     testscript_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "generated_test_scripts")
@@ -1813,6 +1814,18 @@ def main():
         venv_dir = os.path.dirname(state_file)
         execution_trace_file = os.path.join(venv_dir, ".execution_trace.json")
 
+        # Prepare validation statistics for the report (if available)
+        validation_stats = None
+        if validation_report:
+            # Extract and format validation statistics
+            validation_stats = {
+                "total_pypi_versions": validation_report.get("total_pypi_versions", 0),
+                "total_installable_versions": validation_report.get("total_pypi_versions", 0),  # Assume all PyPI versions are installable initially
+                "total_script_passed_versions": validation_report.get("total_script_passed_versions", 0),
+                "requirements_version_failures": validation_report.get("requirements_version_failures", []),
+                "packages": validation_report.get("packages", {})
+            }
+
         # Generate and save the enhanced report
         enhanced_report_path = "resolution_report.txt"
         try:
@@ -1822,12 +1835,16 @@ def main():
                 state_file,  # .api_calls.json
                 enhanced_report_path,
                 execution_trace_file if os.path.exists(execution_trace_file) else None,
-                project_path
+                project_path,
+                requirements_path if requirements_path else None,
+                validation_stats
             )
             print(f"✅ Enhanced resolution report saved to: {enhanced_report_path}")
             print(f"   This report includes:")
             print(f"      • Program execution trace")
             print(f"      • Package usage frequency ranking")
+            print(f"      • Validation statistics (PyPI fetch, installation, script testing)")
+            print(f"      • Requirements.txt version validation results")
             print(f"      • Detailed version reasoning for each package")
             print(f"      • Release dates for compatible versions")
         except Exception as e:

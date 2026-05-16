@@ -124,7 +124,8 @@ def analyze_package_usage_frequency(api_calls_file):
 
 
 def format_enhanced_resolution_report(resolved_packages, api_calls_file,
-                                       execution_trace_file=None, project_path=None):
+                                       execution_trace_file=None, project_path=None,
+                                       requirements_file=None, validation_stats=None):
     """
     Generate an enhanced resolution report with detailed reasoning,
     release dates, and usage frequency ranking.
@@ -134,6 +135,8 @@ def format_enhanced_resolution_report(resolved_packages, api_calls_file,
         api_calls_file: Path to .api_calls.json
         execution_trace_file: Optional path to .execution_trace.json
         project_path: Optional project path for relative paths
+        requirements_file: Optional path to requirements.txt for version comparison
+        validation_stats: Optional dict with validation statistics from script_based_validator
 
     Returns:
         Formatted string with comprehensive report
@@ -171,6 +174,54 @@ def format_enhanced_resolution_report(resolved_packages, api_calls_file,
     output.append("=" * 80)
     output.append("\n" * 2)
 
+    # Section 2.5: Validation Statistics Summary (NEW)
+    if validation_stats:
+        output.append("=" * 80)
+        output.append("📊 VERSION VALIDATION STATISTICS")
+        output.append("=" * 80)
+        output.append("")
+        output.append("This section shows the validation pipeline statistics:")
+        output.append("")
+
+        total_pypi = validation_stats.get('total_pypi_versions', 0)
+        total_installable = validation_stats.get('total_installable_versions', 0)
+        total_script_passed = validation_stats.get('total_script_passed_versions', 0)
+
+        output.append(f"   Step 1 - PyPI Fetch:            {total_pypi:5d} versions")
+        output.append(f"   Step 2 - Installation Test:    {total_installable:5d} versions (uv pip install)")
+        output.append(f"   Step 3 - Script Validation:    {total_script_passed:5d} versions (python script test)")
+        output.append("")
+
+        if total_pypi > 0:
+            install_rate = (total_installable / total_pypi) * 100
+            output.append(f"   Installation Success Rate:     {install_rate:.1f}%")
+
+        if total_installable > 0:
+            script_rate = (total_script_passed / total_installable) * 100
+            output.append(f"   Script Test Success Rate:      {script_rate:.1f}%")
+
+        output.append("")
+
+        # Check for requirements.txt version failures
+        req_failures = validation_stats.get('requirements_version_failures', [])
+        if req_failures:
+            output.append("   ⚠️  WARNING: Requirements.txt Version Failures Detected!")
+            output.append("")
+            output.append("   The following packages have requirements.txt versions that FAILED")
+            output.append("   the python script validation. This indicates potential issues with")
+            output.append("   the test scripts or API breaking changes:")
+            output.append("")
+            for pkg_name, req_version, error_reason in req_failures:
+                output.append(f"      ❌ {pkg_name} (version {req_version})")
+                if error_reason:
+                    output.append(f"         Reason: {error_reason}")
+            output.append("")
+            output.append("   💡 Recommendation: Review the test scripts for these packages")
+            output.append("      or verify the API compatibility of the specified versions.")
+
+        output.append("=" * 80)
+        output.append("\n" * 2)
+
     # Section 3: Detailed Package Version Resolution
     output.append("=" * 80)
     output.append("📦 DETAILED PACKAGE VERSION RESOLUTION")
@@ -180,6 +231,24 @@ def format_enhanced_resolution_report(resolved_packages, api_calls_file,
     if not resolved_packages:
         output.append("⚠️ No packages resolved.")
         return "\n".join(output)
+
+    # Load requirements.txt versions for comparison
+    requirements_versions = {}
+    if requirements_file and os.path.exists(requirements_file):
+        try:
+            with open(requirements_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '==' in line:
+                        pkg_name, version = line.split('==', 1)
+                        pkg_name = pkg_name.strip()
+                        version = version.strip()
+                        # Store both normalized and original names
+                        normalized = pkg_name.lower().replace('_', '-')
+                        requirements_versions[normalized] = version
+                        requirements_versions[pkg_name] = version
+        except Exception as e:
+            pass
 
     # Sort packages by usage frequency for display
     package_order = [pkg for pkg, _ in sorted(
@@ -200,6 +269,7 @@ def format_enhanced_resolution_report(resolved_packages, api_calls_file,
         reasoning = package_data.get('reasoning', {})
         api_usage = package_data.get('api_usage', [])
         release_dates = package_data.get('release_dates', {})
+        validation_status = package_data.get('validation_status', 'unknown')
 
         output.append("-" * 80)
         output.append(f"📦 Package: {package}")
@@ -210,6 +280,17 @@ def format_enhanced_resolution_report(resolved_packages, api_calls_file,
             output.append(f"   Usage: {usage_freq[package]} API calls")
         output.append("")
 
+        # Requirements.txt version (NEW)
+        normalized_pkg = package.lower().replace('_', '-')
+        req_version = requirements_versions.get(normalized_pkg) or requirements_versions.get(package)
+        if req_version:
+            output.append(f"   📋 Requirements.txt version: {req_version}")
+            # Check if requirements version passed validation
+            if versions and req_version not in versions:
+                output.append(f"      ⚠️  WARNING: This version is NOT in the validated versions list!")
+                output.append(f"      This indicates the requirements.txt version failed script validation.")
+            output.append("")
+
         # APIs used
         if api_usage:
             output.append("   APIs Used (that influenced version inference):")
@@ -219,32 +300,87 @@ def format_enhanced_resolution_report(resolved_packages, api_calls_file,
                 output.append(f"      ... and {len(api_usage) - 10} more")
             output.append("")
 
-        # Version resolution reasoning
+        # Version resolution reasoning (MODIFIED - remove PENDING_VALIDATION)
         output.append("   Version Resolution:")
         if reasoning:
             confidence = reasoning.get('confidence', 'unknown')
-            output.append(f"      Confidence: {confidence.upper()}")
+            reasoning_text = reasoning.get('reasoning', '')
 
-            if reasoning.get('detected_patterns'):
-                output.append("      Detected Patterns:")
-                for pattern in reasoning['detected_patterns']:
-                    output.append(f"         - {pattern}")
+            # Skip the meaningless PENDING_VALIDATION section
+            if confidence.lower() != 'pending_validation':
+                output.append(f"      Confidence: {confidence.upper()}")
 
-            if reasoning.get('reasoning'):
-                output.append(f"      Reasoning: {reasoning['reasoning']}")
+                if reasoning.get('detected_patterns'):
+                    output.append("      Detected Patterns:")
+                    for pattern in reasoning['detected_patterns']:
+                        output.append(f"         - {pattern}")
 
-            if reasoning.get('version_constraints'):
-                output.append(f"      Constraint: {reasoning['version_constraints']}")
+                if reasoning_text and 'will be validated by script-based testing' not in reasoning_text:
+                    output.append(f"      Reasoning: {reasoning_text}")
+
+                if reasoning.get('version_constraints'):
+                    output.append(f"      Constraint: {reasoning['version_constraints']}")
+
+        # Add validation statistics for this package (NEW)
+        if validation_stats and 'packages' in validation_stats:
+            pkg_stats = validation_stats['packages'].get(package, {})
+            if pkg_stats:
+                pypi_count = pkg_stats.get('pypi_versions', 0)
+                install_count = pkg_stats.get('installable_versions', 0)
+                script_count = pkg_stats.get('script_passed_versions', 0)
+
+                output.append("")
+                output.append("   Validation Pipeline:")
+                output.append(f"      PyPI versions fetched:          {pypi_count}")
+                output.append(f"      Installable (uv pip install):  {install_count}")
+                output.append(f"      Passed script validation:       {script_count}")
+
+                if pypi_count > 0 and install_count > 0 and script_count > 0:
+                    output.append(f"      Installation success rate:      {(install_count/pypi_count)*100:.1f}%")
+                    output.append(f"      Script validation rate:         {(script_count/install_count)*100:.1f}%")
+
+                # NEW: Check if requirements.txt version is in passed script versions
+                if req_version and script_count > 0 and versions:
+                    if req_version not in versions:
+                        output.append("")
+                        output.append(f"      ⚠️  WARNING: Requirements.txt version ({req_version}) is NOT in")
+                        output.append(f"          the validated versions list!")
+                        output.append(f"          This indicates the requirements.txt version failed script validation.")
+                elif req_version and script_count == 0:
+                    output.append("")
+                    output.append(f"      ⚠️  WARNING: No versions passed script validation!")
+                    output.append(f"          Requirements.txt version ({req_version}) also failed validation.")
+                    output.append(f"          Using requirements.txt version as fallback (not validated).")
+
         output.append("")
 
         # Compatible versions with release dates
-        if versions:
-            output.append(f"   Compatible Versions: {len(versions)} found")
+        # Add requirements.txt version if it's not in the validated list
+        versions_to_display = list(versions) if versions else []
+        if req_version and req_version not in versions_to_display:
+            # Add requirements.txt version at the beginning
+            versions_to_display.insert(0, req_version)
+
+        if versions_to_display:
+            # Sort versions by release date (newest first)
+            def get_sort_key(v):
+                date_str = release_dates.get(v, None)
+                if date_str and date_str != "unknown":
+                    try:
+                        return datetime.strptime(date_str, "%Y-%m-%d")
+                    except:
+                        pass
+                # If no valid date, put at the end
+                return datetime(1970, 1, 1)
+
+            versions_to_display.sort(key=get_sort_key, reverse=True)
+
+            output.append(f"   Compatible Versions: {len(versions_to_display)} found")
             output.append("")
             output.append("      Version          Release Date      Age")
             output.append("      " + "-" * 50)
 
-            for version in versions[:20]:  # Show first 20
+            for version in versions_to_display:  # Show ALL versions
                 release_date = release_dates.get(version, "unknown")
                 # Handle None or empty release_date
                 if release_date is None:
@@ -263,10 +399,12 @@ def format_enhanced_resolution_report(resolved_packages, api_calls_file,
                     except:
                         pass
 
-                output.append(f"      {version:16s} {release_date:16s}  {age}")
+                # Mark requirements.txt version if it's not in the validated list
+                marker = ""
+                if version == req_version and version not in versions:
+                    marker = " (⚠️ from requirements.txt - NOT validated)"
 
-            if len(versions) > 20:
-                output.append(f"      ... and {len(versions) - 20} more versions")
+                output.append(f"      {version:16s} {release_date:16s}  {age}{marker}")
         else:
             output.append("   ⚠️ No compatible versions found")
 
@@ -280,7 +418,8 @@ def format_enhanced_resolution_report(resolved_packages, api_calls_file,
 
 
 def save_enhanced_report(resolved_packages, api_calls_file, output_file,
-                         execution_trace_file=None, project_path=None):
+                         execution_trace_file=None, project_path=None,
+                         requirements_file=None, validation_stats=None):
     """
     Generate and save enhanced resolution report to a file.
 
@@ -290,9 +429,12 @@ def save_enhanced_report(resolved_packages, api_calls_file, output_file,
         output_file: Path to save the report
         execution_trace_file: Optional path to .execution_trace.json
         project_path: Optional project path
+        requirements_file: Optional path to requirements.txt
+        validation_stats: Optional dict with validation statistics
     """
     report = format_enhanced_resolution_report(
-        resolved_packages, api_calls_file, execution_trace_file, project_path
+        resolved_packages, api_calls_file, execution_trace_file, project_path,
+        requirements_file, validation_stats
     )
 
     with open(output_file, 'w', encoding='utf-8') as f:
