@@ -3,13 +3,13 @@
 MockVenv Main Entry Point
 
 This script provides a command-line interface to access three core functionalities:
-1. Reset Environment: Create a mock virtual environment from a requirements.txt file
-2. Resolve Dependencies: Analyze .mock_state.json to generate resolved version configurations
+1. Reset Environment: Create a virtual environment from a requirements.txt file
+2. Resolve Dependencies: Analyze .api_calls.json to generate resolved version configurations
 3. Fix Environment: Analyze exploit failures and identify package version issues
 
 Usage:
-    python main.py --reset --mode <mock|real> --requirements <path_to_requirements.txt>
-    python main.py --resolve --mode <mock|real> [path_to_state.json]
+    python main.py --reset --requirements <path_to_requirements.txt>
+    python main.py --resolve [path_to_state.json]
     python main.py --fix --requirements <path_to_requirements.txt> --project <path_to_project> --exploit <exploit_scripts>
     python main.py --help
 """
@@ -20,41 +20,35 @@ import argparse
 import subprocess
 import json
 import re
+import traceback
+import glob
 from datetime import datetime
 import shutil
 
 
-def reset_environment(requirements_path, mode='mock', python_version=None):
+def reset_environment(requirements_path, python_version=None):
     """
     Create a virtual environment based on the provided requirements.txt file.
 
     Args:
         requirements_path: Path to the requirements.txt file
-        mode: Environment mode - 'mock' (default) or 'real'
         python_version: Optional Python version to use (e.g., '3.10', '3.11')
 
     This function calls reset_env.py to:
     - Destroy the old .venv environment
     - Rebuild a new virtual environment using uv
-    - Install packages based on mode:
-      * mock mode: Install whitelisted packages + Claude SDK + inject llm_mock_hook.py
-      * real mode: Install exact versions from requirements.txt + inject llm_real_hook.py
+    - Install exact versions from requirements.txt + inject llm_real_hook.py
     """
     print("=" * 60)
-    print(f"🔄 RESET ENVIRONMENT MODE ({mode.upper()})")
+    print(f"🔄 RESET ENVIRONMENT")
     print("=" * 60)
 
     if not os.path.exists(requirements_path):
         print(f"❌ Error: Requirements file not found: {requirements_path}")
         sys.exit(1)
 
-    if mode not in ['mock', 'real']:
-        print(f"❌ Error: Invalid mode '{mode}'. Must be 'mock' or 'real'")
-        sys.exit(1)
-
     print(f"📋 Using requirements file: {requirements_path}")
     print(f"📂 Target directory: {os.getcwd()}")
-    print(f"🎯 Mode: {mode}")
     if python_version:
         print(f"🐍 Python version: {python_version}")
 
@@ -66,8 +60,8 @@ def reset_environment(requirements_path, mode='mock', python_version=None):
         print(f"❌ Error: reset_env.py not found at: {reset_script}")
         sys.exit(1)
 
-    # Execute reset_env.py with the requirements file path, mode, and optional python version
-    cmd = [sys.executable, reset_script, requirements_path, mode]
+    # Execute reset_env.py with the requirements file path and optional python version
+    cmd = [sys.executable, reset_script, requirements_path]
     if python_version:
         cmd.append(python_version)
 
@@ -79,13 +73,12 @@ def reset_environment(requirements_path, mode='mock', python_version=None):
         sys.exit(1)
 
 
-def fix_environment(requirements_path, mode, project_path, exploit_scripts):
+def fix_environment(requirements_path, project_path, exploit_scripts):
     """
     Analyze exploit failures and identify package version issues using Claude Code.
 
     Args:
         requirements_path: Path to the requirements.txt file
-        mode: 'real' mode (required for fix)
         project_path: Path to the project directory
         exploit_scripts: List of paths to exploit scripts
 
@@ -96,7 +89,7 @@ def fix_environment(requirements_path, mode, project_path, exploit_scripts):
     - Focus ONLY on package version problems
     """
     print("=" * 60)
-    print("🔧 FIX ENVIRONMENT MODE - Exploit Analysis")
+    print("🔧 FIX ENVIRONMENT - Exploit Analysis")
     print("=" * 60)
 
     if not os.path.exists(requirements_path):
@@ -116,10 +109,6 @@ def fix_environment(requirements_path, mode, project_path, exploit_scripts):
 
     if not os.path.exists(project_path):
         print(f"❌ Error: Project path not found: {project_path}")
-        sys.exit(1)
-
-    if mode != 'real':
-        print(f"❌ Error: Fix mode only supports 'real' mode, got: {mode}")
         sys.exit(1)
 
     requirements_path = os.path.abspath(requirements_path)
@@ -176,7 +165,6 @@ def fix_environment(requirements_path, mode, project_path, exploit_scripts):
 
     print(f"📋 Requirements file: {requirements_path}")
     print(f"📂 Project path: {project_path}")
-    print(f"🎯 Mode: {mode}")
     print(f"🔍 Exploit scripts: {', '.join(exploit_scripts)}")
 
     # Get trace file path
@@ -250,8 +238,6 @@ def fix_environment(requirements_path, mode, project_path, exploit_scripts):
     project_files_content = {}
     try:
         # Find key files in the project that are likely involved in exploit execution
-        import glob
-
         # Search for Python files in the project
         search_patterns = [
             os.path.join(project_path, "**/*.py"),
@@ -758,7 +744,6 @@ You MUST return ONLY valid JSON format without any markdown or additional text."
             print(f"\n✅ Analysis saved to: {analysis_file}")
         except Exception as e:
             print(f"\n⚠️ Warning: Error processing analysis results: {e}")
-            import traceback
             traceback.print_exc()
 
     except ImportError as e:
@@ -766,7 +751,6 @@ You MUST return ONLY valid JSON format without any markdown or additional text."
         sys.exit(1)
     except Exception as e:
         print(f"❌ Error during analysis: {e}")
-        import traceback
         traceback.print_exc()
         sys.exit(1)
 
@@ -775,21 +759,19 @@ You MUST return ONLY valid JSON format without any markdown or additional text."
     print("=" * 60)
 
 
-def resolve_dependencies(mock_state_path=None, mode='mock', requirements_path=None, project_path=None, use_llm=True, python_version=None, num_dockerfiles="1"):
+def resolve_dependencies(mock_state_path=None, requirements_path=None, project_path=None, use_llm=True, python_version=None, num_dockerfiles="1", cve_id=None):
     """
-    Analyze the .mock_state.json or .api_calls.json file to generate resolved version configurations.
+    Analyze the .api_calls.json file to generate resolved version configurations.
 
     Args:
-        mock_state_path: Optional path to .mock_state.json or .api_calls.json file
-                        If not provided, defaults based on mode:
-                        - mock mode: .venv/.mock_state.json
-                        - real mode: .venv/.api_calls.json
-        mode: 'mock' or 'real' - determines which file to read and how to process
+        mock_state_path: Optional path to .api_calls.json file
+                        If not provided, defaults to .venv/.api_calls.json
         requirements_path: Optional path to requirements.txt file for package constraints
         project_path: Optional path to project directory for Docker volume mounting
         use_llm: If True (default), use LLM to generate Dockerfile content. If False, use template.
         python_version: Optional Python version to use for validation (e.g., '3.10', '3.11')
         num_dockerfiles: Number of Dockerfiles to generate: 'all' for all combinations, or a number (default: "1")
+        cve_id: Optional CVE ID (e.g., 'CVE-2026-1462') to filter validated versions based on CVE website info
 
     This function calls resolve_dependencies.py to:
     - Read the state file containing intercepted API features
@@ -798,15 +780,12 @@ def resolve_dependencies(mock_state_path=None, mode='mock', requirements_path=No
     - Generate resolved_versions.json with the final configuration
     """
     print("=" * 60)
-    print(f"🔍 RESOLVE DEPENDENCIES MODE ({mode.upper()})")
+    print(f"🔍 RESOLVE DEPENDENCIES")
     print("=" * 60)
 
     # Default path if not specified
     if mock_state_path is None:
-        if mode == 'real':
-            mock_state_path = os.path.join(os.getcwd(), ".venv", ".api_calls.json")
-        else:
-            mock_state_path = os.path.join(os.getcwd(), ".venv", ".mock_state.json")
+        mock_state_path = os.path.join(os.getcwd(), ".venv", ".api_calls.json")
         print(f"📂 Using default state path: {mock_state_path}")
     else:
         print(f"📂 Using custom state path: {mock_state_path}")
@@ -839,8 +818,8 @@ def resolve_dependencies(mock_state_path=None, mode='mock', requirements_path=No
         print(f"❌ Error: resolve_dependencies.py not found at: {resolve_script}")
         sys.exit(1)
 
-    # Execute resolve_dependencies.py with the state file path, mode, requirements path, project path, use_llm, and python_version
-    cmd = [sys.executable, resolve_script, mock_state_path, mode]
+    # Execute resolve_dependencies.py with the state file path, requirements path, project path, use_llm, python_version, num_dockerfiles, and cve_id
+    cmd = [sys.executable, resolve_script, mock_state_path]
     if requirements_path:
         cmd.append(requirements_path)
     else:
@@ -862,6 +841,12 @@ def resolve_dependencies(mock_state_path=None, mode='mock', requirements_path=No
 
     # Add num_dockerfiles parameter
     cmd.append(num_dockerfiles)
+
+    # Add cve_id parameter
+    if cve_id:
+        cmd.append(cve_id)
+    else:
+        cmd.append("")  # Empty placeholder for cve_id
 
     try:
         subprocess.run(cmd, check=True)
@@ -895,49 +880,30 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Reset environment with a requirements.txt file (mock mode, default)
-  python main.py --reset --mode mock --requirements /path/to/requirements.txt
-
-  # Reset environment in real mode (exact versions from requirements.txt)
-  python main.py --reset --mode real --requirements /path/to/requirements.txt
+  # Reset environment with a requirements.txt file
+  python main.py --reset --requirements /path/to/requirements.txt
 
   # Reset environment with a specific Python version
-  python main.py --reset --mode mock --requirements /path/to/requirements.txt --python 3.10
+  python main.py --reset --requirements /path/to/requirements.txt --python 3.10
 
   # Fix mode: Analyze exploit failures and identify package version issues
   python main.py --fix --requirements /path/to/requirements.txt --project /path/to/project --exploit /path/to/exploit1.sh,/path/to/exploit2.sh
 
-  # Resolve dependencies using default .mock_state.json location (mock mode)
-  python main.py --resolve --mode mock
-
-  # Resolve dependencies using .api_calls.json location (real mode)
-  python main.py --resolve --mode real
+  # Resolve dependencies using default .api_calls.json location
+  python main.py --resolve
 
   # Resolve dependencies using custom state file path
-  python main.py --resolve --mode mock /path/to/.mock_state.json
-  python main.py --resolve --mode real /path/to/.api_calls.json
+  python main.py --resolve /path/to/.api_calls.json
 
   # Resolve dependencies with custom requirements.txt file
-  python main.py --resolve --mode real --requirements /path/to/requirements.txt
+  python main.py --resolve --requirements /path/to/requirements.txt
 
   # Resolve dependencies with project path for Docker volume mounting
-  # Note: In 'real' mode, template-based Dockerfile generation is used by default
-  python main.py --resolve --mode real --requirements /path/to/requirements.txt --project /path/to/project
+  python main.py --resolve --requirements /path/to/requirements.txt --project /path/to/project
 
-  # Resolve dependencies in mock mode (uses LLM by default)
-  python main.py --resolve --mode mock --requirements /path/to/requirements.txt --project /path/to/project
-
-  # Force template-based generation in any mode with --no-llm flag
-  python main.py --resolve --mode mock --no-llm
+  # Force template-based generation with --no-llm flag
+  python main.py --resolve --no-llm
         """
-    )
-
-    parser.add_argument(
-        "--mode",
-        type=str,
-        choices=['mock', 'real'],
-        required=False,
-        help="Environment mode: 'mock' for mock environment with Claude SDK, 'real' for real environment with exact package versions (required for --reset and --resolve)"
     )
 
     parser.add_argument(
@@ -967,7 +933,7 @@ Examples:
     group.add_argument(
         "--reset",
         action="store_true",
-        help="Reset the virtual environment (requires --mode and --requirements)"
+        help="Reset the virtual environment (requires --requirements)"
     )
 
     group.add_argument(
@@ -975,7 +941,7 @@ Examples:
         nargs="?",
         const=True,
         metavar="STATE_FILE",
-        help="Resolve dependencies from .mock_state.json or .api_calls.json (requires --mode, optional: specify custom path)"
+        help="Resolve dependencies from .api_calls.json (optional: specify custom path)"
     )
 
     group.add_argument(
@@ -994,7 +960,7 @@ Examples:
     parser.add_argument(
         "--no-llm",
         action="store_true",
-        help="Force template-based Dockerfile generation (default behavior in 'real' mode, optional override in 'mock' mode)"
+        help="Force template-based Dockerfile generation"
     )
 
     parser.add_argument(
@@ -1003,6 +969,13 @@ Examples:
         metavar="NUMBER",
         default="1",
         help="Number of Dockerfiles to generate: 'all' for all combinations, or a number (default: 1)"
+    )
+
+    parser.add_argument(
+        "--cve",
+        type=str,
+        metavar="CVE_ID",
+        help="Optional CVE ID (e.g., CVE-2026-1462) to filter validated versions based on CVE website information"
     )
 
     # Parse arguments
@@ -1017,39 +990,25 @@ Examples:
             parser.error("--fix requires the --project argument to specify the project directory.")
         if not args.exploit:
             parser.error("--fix requires the --exploit argument to specify exploit scripts (comma-separated).")
-        if args.mode:
-            parser.error("--fix cannot be used with --mode. Use only '--fix --requirements <file> --project <path> --exploit <scripts>'.")
 
         # Parse exploit scripts (comma-separated)
         exploit_scripts = [script.strip() for script in args.exploit.split(',')]
 
-        # Mode is always 'real' for fix
-        fix_environment(args.requirements, 'real', args.project, exploit_scripts)
+        fix_environment(args.requirements, args.project, exploit_scripts)
     elif args.reset:
-        if not args.mode:
-            parser.error("--reset requires the --mode argument (mock or real).")
         if not args.requirements:
             parser.error("--reset requires the --requirements argument to specify the requirements file.")
-        reset_environment(args.requirements, mode=args.mode, python_version=args.python)
+        reset_environment(args.requirements, python_version=args.python)
     elif args.resolve:
-        if not args.mode:
-            parser.error("--resolve requires the --mode argument (mock or real).")
-        # Determine if LLM should be used based on mode and user flags
-        # In 'real' mode: default to template-based generation (use_llm=False)
-        # In 'mock' mode: default to LLM-based generation (use_llm=True)
-        # User can override with --no-llm flag in any mode
-        if args.no_llm:
-            use_llm = False
-        else:
-            # Default behavior based on mode
-            use_llm = (args.mode == 'mock')
+        # Determine if LLM should be used based on user flags
+        use_llm = not args.no_llm
 
         # If args.resolve is True (no path provided), use default path
         if args.resolve is True:
-            resolve_dependencies(mode=args.mode, requirements_path=args.requirements, project_path=args.project, use_llm=use_llm, python_version=args.python, num_dockerfiles=args.dockerfiles)
+            resolve_dependencies(requirements_path=args.requirements, project_path=args.project, use_llm=use_llm, python_version=args.python, num_dockerfiles=args.dockerfiles, cve_id=args.cve)
         else:
             # Custom path provided
-            resolve_dependencies(args.resolve, mode=args.mode, requirements_path=args.requirements, project_path=args.project, use_llm=use_llm, python_version=args.python, num_dockerfiles=args.dockerfiles)
+            resolve_dependencies(args.resolve, requirements_path=args.requirements, project_path=args.project, use_llm=use_llm, python_version=args.python, num_dockerfiles=args.dockerfiles, cve_id=args.cve)
 
 
 if __name__ == "__main__":

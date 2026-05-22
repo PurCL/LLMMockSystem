@@ -3,6 +3,7 @@ import os
 import json
 import threading
 import re
+import traceback
 from claude_agent_sdk import query, ClaudeAgentOptions
 
 # Global environment configuration
@@ -24,7 +25,6 @@ def _run_sync(async_func, *args, **kwargs):
             result_container.append(("SUCCESS", res))
         except Exception as ex:
             # Capture full exception details for better debugging
-            import traceback
             error_details = f"{str(ex)}\n\nFull traceback:\n{traceback.format_exc()}"
             result_container.append(("ERROR", error_details))
         finally:

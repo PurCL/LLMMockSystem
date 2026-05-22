@@ -125,7 +125,7 @@ def analyze_package_usage_frequency(api_calls_file):
 
 def format_enhanced_resolution_report(resolved_packages, api_calls_file,
                                        execution_trace_file=None, project_path=None,
-                                       requirements_file=None, validation_stats=None):
+                                       requirements_file=None, validation_stats=None, cve_filtering_report=None):
     """
     Generate an enhanced resolution report with detailed reasoning,
     release dates, and usage frequency ranking.
@@ -137,6 +137,7 @@ def format_enhanced_resolution_report(resolved_packages, api_calls_file,
         project_path: Optional project path for relative paths
         requirements_file: Optional path to requirements.txt for version comparison
         validation_stats: Optional dict with validation statistics from script_based_validator
+        cve_filtering_report: Optional dict with CVE filtering information
 
     Returns:
         Formatted string with comprehensive report
@@ -222,6 +223,56 @@ def format_enhanced_resolution_report(resolved_packages, api_calls_file,
         output.append("=" * 80)
         output.append("\n" * 2)
 
+    # Section 2.6: CVE Filtering Report (NEW)
+    if cve_filtering_report:
+        output.append("=" * 80)
+        output.append("🔒 CVE-BASED VERSION FILTERING")
+        output.append("=" * 80)
+        output.append("")
+        output.append("This section shows how package versions were filtered based on CVE information:")
+        output.append("")
+
+        packages_affected = cve_filtering_report.get('packages_affected', 0)
+        total_filtered = cve_filtering_report.get('total_filtered_versions', 0)
+        cve_filtered_packages = cve_filtering_report.get('cve_filtered_packages', {})
+
+        output.append(f"   Packages affected by CVE filtering:  {packages_affected}")
+        output.append(f"   Total versions removed by CVE filter: {total_filtered}")
+        output.append("")
+
+        if cve_filtered_packages:
+            output.append("   📋 Detailed CVE Filtering Results:")
+            output.append("")
+
+            for pkg_name, filter_info in cve_filtered_packages.items():
+                output.append(f"   📦 {pkg_name}:")
+                output.append(f"      • Original validated versions:  {filter_info['original_count']}")
+                output.append(f"      • CVE affected versions:        {', '.join(filter_info.get('cve_affected_versions', []))}")
+                output.append(f"      • Final filtered versions:      {filter_info['filtered_count']}")
+                output.append(f"      • Versions removed:             {filter_info['removed_count']}")
+
+                final_versions = filter_info.get('final_versions', [])
+                if final_versions:
+                    output.append(f"      • Kept versions:                {', '.join(final_versions)}")
+
+                req_version = filter_info.get('requirements_version')
+                if req_version:
+                    if req_version in final_versions:
+                        output.append(f"      ✅ Requirements.txt version ({req_version}) is in final list")
+                    else:
+                        output.append(f"      ⚠️  Requirements.txt version ({req_version}) NOT in CVE affected versions")
+                        output.append(f"         but was kept as fallback")
+
+                output.append("")
+
+            output.append("   💡 Note: CVE filtering ensures only versions mentioned in the CVE")
+            output.append("      are retained, helping to accurately reproduce the vulnerability.")
+        else:
+            output.append("   ℹ️  No packages were filtered by CVE information.")
+
+        output.append("=" * 80)
+        output.append("\n" * 2)
+
     # Section 3: Detailed Package Version Resolution
     output.append("=" * 80)
     output.append("📦 DETAILED PACKAGE VERSION RESOLUTION")
@@ -270,14 +321,19 @@ def format_enhanced_resolution_report(resolved_packages, api_calls_file,
         api_usage = package_data.get('api_usage', [])
         release_dates = package_data.get('release_dates', {})
         validation_status = package_data.get('validation_status', 'unknown')
+        no_api_log = package_data.get('no_api_log', False)
 
         output.append("-" * 80)
         output.append(f"📦 Package: {package}")
+        if no_api_log:
+            output.append("   ⚠️  NO API LOG AVAILABLE")
         output.append("-" * 80)
 
         # Usage frequency
         if package in usage_freq:
             output.append(f"   Usage: {usage_freq[package]} API calls")
+        elif no_api_log:
+            output.append(f"   Usage: No API calls recorded (no API log)")
         output.append("")
 
         # Requirements.txt version (NEW)
@@ -288,7 +344,10 @@ def format_enhanced_resolution_report(resolved_packages, api_calls_file,
             # Check if requirements version passed validation
             if versions and req_version not in versions:
                 output.append(f"      ⚠️  WARNING: This version is NOT in the validated versions list!")
-                output.append(f"      This indicates the requirements.txt version failed script validation.")
+                if no_api_log:
+                    output.append(f"      (No API log available - only installation test was performed)")
+                else:
+                    output.append(f"      This indicates the requirements.txt version failed script validation.")
             output.append("")
 
         # APIs used
@@ -298,6 +357,10 @@ def format_enhanced_resolution_report(resolved_packages, api_calls_file,
                 output.append(f"      • {api}")
             if len(api_usage) > 10:
                 output.append(f"      ... and {len(api_usage) - 10} more")
+            output.append("")
+        elif no_api_log:
+            output.append("   APIs Used: None (no API log available)")
+            output.append("   ℹ️  This package was tested using 'uv pip install' only")
             output.append("")
 
         # Version resolution reasoning (MODIFIED - remove PENDING_VALIDATION)
@@ -419,7 +482,7 @@ def format_enhanced_resolution_report(resolved_packages, api_calls_file,
 
 def save_enhanced_report(resolved_packages, api_calls_file, output_file,
                          execution_trace_file=None, project_path=None,
-                         requirements_file=None, validation_stats=None):
+                         requirements_file=None, validation_stats=None, cve_filtering_report=None):
     """
     Generate and save enhanced resolution report to a file.
 
@@ -431,10 +494,11 @@ def save_enhanced_report(resolved_packages, api_calls_file, output_file,
         project_path: Optional project path
         requirements_file: Optional path to requirements.txt
         validation_stats: Optional dict with validation statistics
+        cve_filtering_report: Optional dict with CVE filtering information
     """
     report = format_enhanced_resolution_report(
         resolved_packages, api_calls_file, execution_trace_file, project_path,
-        requirements_file, validation_stats
+        requirements_file, validation_stats, cve_filtering_report
     )
 
     with open(output_file, 'w', encoding='utf-8') as f:

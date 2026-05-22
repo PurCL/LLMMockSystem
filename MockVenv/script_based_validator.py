@@ -22,10 +22,61 @@ import sys
 import subprocess
 import tempfile
 import shutil
+import datetime
 from typing import Dict, List, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
 from llm_client import _ask_claude, _run_sync
+
+# Custom temporary directory to avoid disk quota issues on /tmp
+CUSTOM_TMP_DIR = "/home/jian1000/data3/tmp/mockvenv_temp"
+
+# Ensure the custom temp directory exists
+if not os.path.exists(CUSTOM_TMP_DIR):
+    os.makedirs(CUSTOM_TMP_DIR, exist_ok=True)
+
+# Load PyPI to Python module import mapping
+PYPI_IMPORT_MAPPING = {}
+def load_import_mapping():
+    """Load the PyPI to Python module import mapping from JSON file."""
+    global PYPI_IMPORT_MAPPING
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    mapping_file = os.path.join(script_dir, 'pypi_import_mapping.json')
+
+    if os.path.exists(mapping_file):
+        try:
+            with open(mapping_file, 'r') as f:
+                PYPI_IMPORT_MAPPING = json.load(f)
+            print(f"✅ Loaded {len(PYPI_IMPORT_MAPPING)} PyPI import mappings")
+        except Exception as e:
+            print(f"⚠️ Warning: Could not load pypi_import_mapping.json: {e}")
+    else:
+        print(f"⚠️ Warning: pypi_import_mapping.json not found at {mapping_file}")
+
+# Load mapping at module initialization
+load_import_mapping()
+
+
+def pypi_to_import_name(package_name: str) -> str:
+    """
+    Convert PyPI package name to Python import name.
+
+    Args:
+        package_name: PyPI package name (e.g., 'absl-py', 'typing-extensions')
+
+    Returns:
+        Python import name (e.g., 'absl', 'typing_extensions')
+    """
+    # Normalize package name to lowercase for lookup
+    normalized_name = package_name.lower().replace('_', '-')
+
+    # Check if there's a mapping
+    if normalized_name in PYPI_IMPORT_MAPPING:
+        return PYPI_IMPORT_MAPPING[normalized_name]
+
+    # Fallback: replace hyphens with underscores
+    # This works for most packages like charset-normalizer -> charset_normalizer
+    return package_name.replace('-', '_')
 
 
 def parse_api_calls_by_package(api_calls_file: str) -> Dict[str, List[str]]:
@@ -94,11 +145,14 @@ def generate_test_script_with_llm(package_name: str, api_calls: List[str]) -> st
     Returns:
         Generated Python test script as a string
     """
+    # Convert PyPI package name to Python import name
+    import_name = pypi_to_import_name(package_name)
+
     # Import llm_client
     script_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, script_dir)
 
-    prompt = f"""Generate a Python test script to validate API compatibility for package: {package_name}
+    prompt = f"""You are an expert Python testing engineer. Generate a test script to verify the existence of APIs in the {package_name} library (Python import name: {import_name}).
 
 API calls observed from runtime execution (sample):
 {chr(10).join(api_calls[:100])}
@@ -106,61 +160,98 @@ API calls observed from runtime execution (sample):
 
 Total API calls: {len(api_calls)}
 
-IMPORTANT Requirements:
-1. Import the package "{package_name}"
-2. Use hasattr() to check if APIs exist - DO NOT try to call or instantiate them
-3. The script should:
-   - Import necessary modules from {package_name}
-   - For each API call like "package.module.Class()", check: hasattr(package.module, 'Class')
-   - For each API call like "package.module.function()", check: hasattr(package.module, 'function')
-   - Ignore parameter values in API calls - only check attribute names
-   - Count successful checks and missing APIs
-   - If at least 80% of APIs exist, print "SUCCESS" and exit(0)
-   - If less than 80% exist, print "FAILED: only X/Y APIs found" and exit(1)
-4. Use a counter to track found vs missing APIs - be tolerant of minor API changes
-5. Make the script simple and safe - only check existence, do not execute
-6. DO NOT use mock objects or test frameworks
-7. Handle import errors and missing attributes gracefully with try-except
+CRITICAL RULE: You MUST use the EXACT check_api function provided below. Do NOT modify its logic. Your ONLY job is to:
+1. Parse the API calls to extract module paths and attribute names
+2. Generate the check_api('module.path', 'attribute_name') calls at the bottom
+3. For an API call like "numpy.core.memmap.memmap()", check it as: check_api('numpy.core', 'memmap') - NOT check_api('numpy.core.memmap', 'memmap')
+4. Prefer public-facing API paths (e.g., numpy.memmap) over deep internal paths (e.g., numpy.core.memmap) when possible
+5. Only check attribute names, ignore parameter values in API calls
 
 Return ONLY the Python script code, no markdown, no explanations.
 
-Example structure:
+MANDATORY TEMPLATE - Use this exact code structure:
+
 ```python
 #!/usr/bin/env python3
 import sys
+import importlib
 
-try:
-    import {package_name}
+total_checks = 0
+found_apis = 0
 
-    total_checks = 0
-    found_apis = 0
-    missing_apis = []
-
-    # Check API availability using hasattr
+def check_api(module_path, attr_name):
+    \"\"\"
+    Check if an API exists in the specified module.
+    Uses importlib.import_module() for robust module loading.
+    \"\"\"
+    global total_checks, found_apis
     total_checks += 1
-    if hasattr({package_name}, 'SomeClass'):
-        found_apis += 1
-    else:
-        missing_apis.append('{package_name}.SomeClass')
+    try:
+        # 1. Dynamically import the module first
+        module = importlib.import_module(module_path)
+        # 2. Check for the attribute
+        if hasattr(module, attr_name):
+            found_apis += 1
+        else:
+            print(f"FAILED: {{module_path}}.{{attr_name}} not found in module")
+            sys.exit(1)
+    except ImportError:
+        # Fallback: Sometimes module_path includes a class (e.g., a.b.MyClass)
+        # In this case, we need to import the parent module and get the class
+        try:
+            parts = module_path.rsplit('.', 1)
+            if len(parts) == 2:
+                parent_module = importlib.import_module(parts[0])
+                parent_obj = getattr(parent_module, parts[1])
+                if hasattr(parent_obj, attr_name):
+                    found_apis += 1
+                    return
+        except Exception:
+            pass
+        print(f"FAILED: {{module_path}} could not be imported")
+        sys.exit(1)
+    except Exception as e:
+        print(f"FAILED: {{module_path}}.{{attr_name}} - {{type(e).__name__}}: {{e}}")
+        sys.exit(1)
 
-    # More checks...
+# Main execution
+try:
+    # Import the base package first to verify it exists
+    import {import_name}
 
-    # Success if at least 80% of APIs found
-    success_rate = found_apis / total_checks if total_checks > 0 else 0
-    if success_rate >= 0.8:
-        print("SUCCESS")
+    # Generate check_api calls based on the API calls
+    # Example: check_api('{import_name}', 'SomeClass')
+    # Example: check_api('{import_name}.submodule', 'function_name')
+
+    # YOUR GENERATED CHECK_API CALLS GO HERE:
+    # (Generate based on the API calls provided above)
+
+    # Success only if ALL APIs found
+    if found_apis == total_checks:
+        print(f"SUCCESS: All {{found_apis}}/{{total_checks}} APIs found")
         sys.exit(0)
     else:
-        print(f"FAILED: only {{found_apis}}/{{total_checks}} APIs found ({{success_rate*100:.1f}}%)")
+        print(f"FAILED: only {{found_apis}}/{{total_checks}} APIs found")
         sys.exit(1)
+
+except ImportError as e:
+    print(f"FAILED: Cannot import {import_name} - {{e}}")
+    sys.exit(1)
 except Exception as e:
-    print(f"FAILED: {{e}}")
+    print(f"FAILED: {{type(e).__name__}}: {{e}}")
     sys.exit(1)
 ```
 
-Generate the complete test script:"""
+Generate the complete test script with the check_api() calls filled in:"""
 
-    system_prompt = """You are a Python test script generator. Generate clean, executable Python code without markdown formatting or explanations."""
+    system_prompt = """You are a Python test script generator specializing in API compatibility testing.
+
+CRITICAL RULES:
+1. Always use importlib.import_module() for dynamic module loading - NEVER use module_string.split('.') with getattr loops
+2. The check_api() function logic is PROVIDED and must NOT be modified
+3. Only generate the check_api() calls based on the API calls in the prompt
+4. Distinguish between Modules and Attributes correctly to avoid false failures
+5. Generate clean, executable Python code without markdown formatting or explanations"""
 
     try:
         result = _run_sync(_ask_claude, prompt, system_prompt)
@@ -194,8 +285,11 @@ def generate_simple_test_script(package_name: str, api_calls: List[str]) -> str:
         api_calls: List of API call signatures
 
     Returns:
-        Simple Python test script with 80% tolerance
+        Simple Python test script requiring 100% API success (ANY error is INCOMPATIBLE)
     """
+    # Convert PyPI package name to Python import name
+    import_name = pypi_to_import_name(package_name)
+
     # Parse API calls to extract modules and attributes
     imports = set()
     api_checks = []
@@ -240,35 +334,33 @@ def generate_simple_test_script(package_name: str, api_calls: List[str]) -> str:
         if hasattr(obj, '{attr_name}'):
             found_apis += 1
         else:
-            missing_apis.append('{api_path}')
-    except (AttributeError, ImportError):
-        # Module structure might be different, skip this check
-        total_checks -= 1  # Don't count failed imports""")
+            print(f"FAILED: {api_path} not found")
+            sys.exit(1)
+    except Exception as e:
+        # ANY error (including ModuleNotFoundError) is INCOMPATIBLE
+        print(f"FAILED: {api_path} - {{type(e).__name__}}: {{e}}")
+        sys.exit(1)""")
 
     script = f"""#!/usr/bin/env python3
 import sys
 
 try:
     # Import package
-    import {package_name}
+    import {import_name}
 
-    # Track API availability - be tolerant of version differences (80% threshold)
+    # Track API availability - require 100% success (ANY error is INCOMPATIBLE)
     total_checks = 0
     found_apis = 0
-    missing_apis = []
 
     # Check API availability (sample of {len(api_calls)} total APIs)
 {chr(10).join(check_lines)}
 
-    # Success if at least 80% of APIs are found
-    success_rate = found_apis / total_checks if total_checks > 0 else 0
-    if success_rate >= 0.8:
-        print("SUCCESS")
+    # Success only if ALL APIs found
+    if found_apis == total_checks:
+        print(f"SUCCESS: All {{found_apis}}/{{total_checks}} APIs found")
         sys.exit(0)
     else:
-        print(f"FAILED: only {{found_apis}}/{{total_checks}} APIs found ({{success_rate*100:.1f}}%)")
-        if missing_apis[:3]:
-            print(f"Sample missing: {{', '.join(missing_apis[:3])}}")
+        print(f"FAILED: only {{found_apis}}/{{total_checks}} APIs found")
         sys.exit(1)
 
 except Exception as e:
@@ -283,8 +375,9 @@ def test_version_with_uv(
     package_name: str,
     version: str,
     test_script: str,
-    python_version: str = "3.10",
-    timeout: int = 30
+    python_version: str = "3.11",
+    timeout: int = 30,
+    requirements_file: str = None
 ) -> Tuple[bool, Optional[str]]:
     """
     Test a package version by running the test script in a uv virtual environment.
@@ -293,17 +386,18 @@ def test_version_with_uv(
         package_name: Name of the package
         version: Version string to test
         test_script: Python test script content
-        python_version: Python version for uv venv (e.g., '3.10')
+        python_version: Python version for uv venv (e.g., '3.11')
         timeout: Timeout in seconds
+        requirements_file: Path to requirements.txt to install additional dependencies
 
     Returns:
         Tuple of (is_compatible, error_message)
     """
     # Ensure python_version is not empty
     if not python_version or python_version.strip() == "":
-        python_version = "3.10"
+        python_version = "3.11"
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory(dir=CUSTOM_TMP_DIR) as tmpdir:
         # Write test script
         test_script_path = os.path.join(tmpdir, "test_script.py")
         with open(test_script_path, 'w') as f:
@@ -326,7 +420,7 @@ def test_version_with_uv(
             if result.returncode != 0:
                 return False, f"Failed to create venv: {result.stderr[:200]}"
 
-            # Step 2: Install the package version
+            # Step 2: Install the package version FIRST
             # Use explicit bash and PATH modification instead of source
             python_bin = os.path.join(venv_path, "bin", "python")
             uv_pip_cmd = f"uv pip install --python {python_bin} {package_name}=={version}"
@@ -343,7 +437,63 @@ def test_version_with_uv(
             if result.returncode != 0:
                 return False, f"Failed to install {package_name}=={version}: {result.stderr[:200]}"
 
-            # Step 3: Run the test script
+            # Step 3: Install other dependencies from requirements.txt (if provided)
+            # Install one by one, skip if conflicts occur
+            if requirements_file and os.path.exists(requirements_file):
+                with open(requirements_file, 'r') as f:
+                    requirements_lines = f.readlines()
+
+                # Normalize package name for comparison
+                normalized_pkg_name = package_name.lower().replace('_', '-')
+
+                for line in requirements_lines:
+                    line = line.strip()
+                    # Skip empty lines and comments
+                    if not line or line.startswith('#'):
+                        continue
+
+                    # Parse package name from line (handle package==version format)
+                    if '==' in line:
+                        req_pkg_name, req_version = line.split('==', 1)
+                        req_pkg_name = req_pkg_name.strip()
+                        req_version = req_version.strip()
+                    else:
+                        req_pkg_name = line.strip()
+                        req_version = None
+
+                    # Skip the package we're currently testing
+                    normalized_req_pkg_name = req_pkg_name.lower().replace('_', '-')
+                    if normalized_req_pkg_name == normalized_pkg_name:
+                        continue
+
+                    # Try to install this dependency
+                    if req_version:
+                        install_cmd = f"uv pip install --python {python_bin} {req_pkg_name}=={req_version}"
+                    else:
+                        install_cmd = f"uv pip install --python {python_bin} {req_pkg_name}"
+
+                    try:
+                        result = subprocess.run(
+                            install_cmd,
+                            shell=True,
+                            capture_output=True,
+                            text=True,
+                            timeout=timeout,
+                            executable='/bin/bash'
+                        )
+
+                        # If installation failed (conflict or not found), just skip it
+                        if result.returncode != 0:
+                            # Silently skip conflicting packages
+                            pass
+                    except subprocess.TimeoutExpired:
+                        # Skip if timeout
+                        pass
+                    except Exception:
+                        # Skip if any error
+                        pass
+
+            # Step 4: Run the test script
             run_cmd = f"{python_bin} {test_script_path}"
 
             result = subprocess.run(
@@ -388,176 +538,28 @@ def _generate_script_worker_top_level(args):
     return (package_name, test_script)
 
 
-def validate_package_versions_with_scripts(
-    package_name: str,
-    test_script: str,
-    candidate_versions: List[str],
-    python_version: str = "3.10",
-    max_workers: int = 4,
-    timeout: int = 30,
-    requirements_version: str = None
-) -> Tuple[List[str], Optional[str], Optional[dict]]:
-    """
-    Validate package versions using script-based testing with a pre-generated test script.
-
-    Args:
-        package_name: Name of the package
-        test_script: Pre-generated Python test script content
-        candidate_versions: List of version strings to test
-        python_version: Python version for testing (e.g., '3.10')
-        max_workers: Number of parallel workers
-        timeout: Timeout per version test
-        requirements_version: The version specified in requirements.txt (for validation)
-
-    Returns:
-        Tuple of (List of compatible version strings, Optional error reason, Optional stats dict)
-    """
-    print(f"\n🔍 Validating {package_name} with script-based testing...")
-    print(f"   📊 Testing {len(candidate_versions)} versions")
-    print(f"   🐍 Using Python {python_version}")
-    print(f"   🧪 Using {max_workers} parallel workers")
-    if requirements_version:
-        print(f"   📋 Requirements.txt version: {requirements_version}")
-
-    # Initialize statistics
-    stats = {
-        "pypi_versions": len(candidate_versions),
-        "installable_versions": 0,
-        "script_passed_versions": 0,
-        "requirements_version_failed": False,
-        "requirements_version_error": None
-    }
-
-    # STEP 1: First, test the requirements.txt version with the test script
-    requirements_version_exists = False
-    if requirements_version:
-        print(f"\n   🧪 Step 1: Testing requirements.txt version ({requirements_version}) with generated script...")
+def _mp_worker_test_version(args):
+    pkg_name, version, script_content, python_version, timeout, req_file = args
+    try:
         is_compatible, error_msg = test_version_with_uv(
-            package_name,
-            requirements_version,
-            test_script,
-            python_version,
-            timeout
+            pkg_name, version, script_content, python_version, timeout, req_file
         )
-
-        if not is_compatible:
-            # requirements.txt version failed the test script
-            print(f"   ❌ Requirements.txt version FAILED the test!")
-            print(f"   ❌ Error: {error_msg[:200] if error_msg else 'Unknown error'}")
-
-            # Record this failure
-            stats["requirements_version_failed"] = True
-            stats["requirements_version_error"] = error_msg[:200] if error_msg else 'Unknown error'
-
-            # CHANGED: Always continue testing other versions instead of returning early
-            # Even if test script has issues, we should find versions that work with the script
-            print(f"   ⚠️ Requirements.txt version failed validation")
-            print(f"   📌 Will continue testing all candidate versions to find compatible ones...")
-            requirements_version_exists = False
-        else:
-            print(f"   ✅ Requirements.txt version PASSED the test!")
-            print(f"   ▶️ Proceeding to test other versions...")
-            requirements_version_exists = True
-
-    # STEP 2: Test all versions in parallel
-    print(f"\n   🧪 Step 2: Testing all {len(candidate_versions)} candidate versions...")
-    compatible_versions = []
-    incompatible_count = 0
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all tasks
-        future_to_version = {
-            executor.submit(
-                test_version_with_uv,
-                package_name,
-                version,
-                test_script,
-                python_version,
-                timeout
-            ): version
-            for version in candidate_versions
-        }
-
-        # Process results as they complete
-        for i, future in enumerate(as_completed(future_to_version), 1):
-            version = future_to_version[future]
-
-            try:
-                is_compatible, error_msg = future.result()
-
-                if is_compatible:
-                    compatible_versions.append(version)
-                    print(f"   [{i}/{len(candidate_versions)}] {version} ✅ COMPATIBLE")
-                else:
-                    incompatible_count += 1
-                    error_preview = error_msg[:80] if error_msg else "Unknown error"
-                    print(f"   [{i}/{len(candidate_versions)}] {version} ❌ INCOMPATIBLE ({error_preview})")
-
-            except Exception as e:
-                incompatible_count += 1
-                print(f"   [{i}/{len(candidate_versions)}] {version} ❌ ERROR: {str(e)[:80]}")
-
-    print(f"\n   ✅ Found {len(compatible_versions)} compatible versions")
-    print(f"   ❌ Filtered out {incompatible_count} incompatible versions")
-
-    # Update statistics
-    stats["script_passed_versions"] = len(compatible_versions)
-    # Note: installable_versions is the same as script_passed_versions since we only test script on successfully installed packages
-
-    # STEP 3: Verify that requirements.txt version is in the compatible list
-    if requirements_version and compatible_versions and requirements_version_exists:
-        if requirements_version not in compatible_versions:
-            print(f"\n   ⚠️ WARNING: Requirements.txt version ({requirements_version}) NOT in compatible list!")
-            print(f"   ⚠️ This indicates an error in validation - the version that should work is missing")
-            # CHANGED: Don't return requirements_version if it's not in compatible list
-            # Instead, use the compatible versions we found
-            print(f"   📌 Using {len(compatible_versions)} validated compatible versions instead")
-            return compatible_versions, "requirements_version_not_in_compatible_using_validated", stats
-
-        print(f"   ✅ Verification passed: Requirements.txt version ({requirements_version}) is in compatible list")
-    elif requirements_version and not requirements_version_exists:
-        print(f"\n   ⚠️ Requirements.txt version ({requirements_version}) failed validation")
-        if compatible_versions:
-            print(f"   ✅ Found {len(compatible_versions)} compatible versions from PyPI")
-        else:
-            print(f"   ❌ No compatible versions found!")
-
-    # If no compatible versions found at all, this indicates a serious problem
-    if not compatible_versions:
-        print(f"\n   ❌ CRITICAL: No compatible versions found after testing {len(candidate_versions)} candidates!")
-        print(f"   ⚠️ This indicates the test script may be incorrect or the package has API breaking changes")
-        return [], "no_compatible_versions_found", stats
-
-    return compatible_versions, None, stats
+        return (version, is_compatible, error_msg)
+    except Exception as e:
+        return (version, False, str(e))
 
 
 def validate_all_packages_with_scripts(
     api_calls_file: str,
-    resolved_versions_file: str,
-    output_file: str = "validated_versions.json",
-    python_version: str = "3.10",
+    fetched_packages: dict,
+    python_version: str = "3.11",
     max_workers: int = 4,
     timeout: int = 30,
     requirements_file: str = None,
     max_retries: int = 5
 ):
-    """
-    Validate all packages using script-based testing with retry logic.
-
-    OPTIMIZATION: Generate test script ONCE per package, then test all versions in parallel.
-
-    Args:
-        api_calls_file: Path to .api_calls.json
-        resolved_versions_file: Path to resolved_versions.json
-        output_file: Path to save validated versions
-        python_version: Python version for testing (e.g., '3.10')
-        max_workers: Number of parallel workers per package
-        timeout: Timeout per version test
-        requirements_file: Path to original requirements.txt to get original versions
-        max_retries: Maximum number of retries for inference_failed cases (default: 5)
-    """
     print("=" * 70)
-    print("🧪 SCRIPT-BASED VERSION VALIDATOR (with retry logic)")
+    print("🧪 SCRIPT-BASED VERSION VALIDATOR (Sequential Packages, Parallel Versions)")
     print("=" * 70)
 
     # Load API calls
@@ -565,177 +567,110 @@ def validate_all_packages_with_scripts(
     api_by_package = parse_api_calls_by_package(api_calls_file)
     print(f"✅ Found API calls for {len(api_by_package)} packages")
 
-    # Load resolved versions
-    print(f"\n📂 Loading resolved versions from: {resolved_versions_file}")
-    with open(resolved_versions_file, 'r') as f:
-        resolved_data = json.load(f)
+    # Use fetched_packages directly (it's already a dict)
+    print(f"\n📂 Using fetched packages: {len(fetched_packages)} packages")
 
-    resolved_packages = resolved_data.get('resolved_packages', {})
-    print(f"✅ Found {len(resolved_packages)} packages")
+    print(f"✅ Found {len(fetched_packages)} packages")
 
     # Load original requirements.txt to get original versions
     original_versions = {}
     if requirements_file and os.path.exists(requirements_file):
-        print(f"\n📂 Loading original versions from: {requirements_file}")
         try:
             with open(requirements_file, 'r') as f:
                 for line in f:
                     line = line.strip()
                     if line and not line.startswith('#') and '==' in line:
                         pkg_name, version = line.split('==', 1)
-                        pkg_name = pkg_name.strip()
-                        version = version.strip()
-                        # Normalize package name for lookup
-                        normalized_name = pkg_name.lower().replace('_', '-')
-                        original_versions[normalized_name] = (pkg_name, version)
+                        normalized_name = pkg_name.strip().lower().replace('_', '-')
+                        original_versions[normalized_name] = (pkg_name.strip(), version.strip())
             print(f"✅ Loaded {len(original_versions)} package versions from requirements.txt")
         except Exception as e:
             print(f"⚠️ Warning: Could not load requirements.txt: {e}")
 
-    # STEP 1: Generate test scripts for all packages with API calls (ONCE per package)
     print("\n" + "=" * 70)
-    print("🤖 STEP 1: Generating test scripts with LLM (one script per package)")
-    print("=" * 70)
-
-    test_script_dir = os.path.join(os.path.dirname(__file__), "generated_test_scripts")
-    os.makedirs(test_script_dir, exist_ok=True)
-
-    package_test_scripts = {}  # {package_name: test_script_content}
-    packages_with_api = [pkg for pkg in resolved_packages.keys() if pkg in api_by_package and api_by_package[pkg]]
-
-    print(f"📦 Generating test scripts for {len(packages_with_api)} packages...")
-
-    # Calculate number of processes to use: min(32, cpu_count())
-    num_processes = min(32, multiprocessing.cpu_count())
-    print(f"🚀 Using {num_processes} parallel processes for test script generation")
-
-    # Prepare arguments for parallel processing
-    process_args = [
-        (idx, len(packages_with_api), package_name, api_by_package[package_name], test_script_dir)
-        for idx, package_name in enumerate(packages_with_api, 1)
-    ]
-
-    # Process packages in parallel
-    with multiprocessing.Pool(processes=num_processes) as pool:
-        results = pool.map(_generate_script_worker_top_level, process_args)
-
-    # Collect results
-    for package_name, test_script in results:
-        package_test_scripts[package_name] = test_script
-
-    print(f"\n✅ Generated {len(package_test_scripts)} test scripts")
-
-    # STEP 2: Validate each package using pre-generated test scripts
-    print("\n" + "=" * 70)
-    print("🧪 STEP 2: Validating package versions with generated test scripts")
+    print("🧪 Validating packages sequentially (Versions in parallel)")
     print("=" * 70)
 
     validated_packages = {}
     validation_report = {
-        "total_packages": len(resolved_packages),
+        "total_packages": len(fetched_packages),
         "validated_packages": 0,
         "total_candidate_versions": 0,
         "total_compatible_versions": 0,
         "python_version": python_version,
         "packages": {},
-        # NEW: Track statistics for the report
         "total_pypi_versions": 0,
         "total_installable_versions": 0,
         "total_script_passed_versions": 0,
-        "requirements_version_failures": []  # [(pkg_name, version, error_reason)]
+        "requirements_version_failures": [] 
     }
 
-    for idx, (package_name, candidate_versions) in enumerate(resolved_packages.items(), 1):
-        print(f"\n[{idx}/{len(resolved_packages)}] Processing {package_name}")
+    num_processes = min(max_workers, multiprocessing.cpu_count())
+    print(f"🖥️ Using {num_processes} parallel processes for version testing.")
+
+    for idx, (package_name, candidate_versions) in enumerate(fetched_packages.items(), 1):
+        print(f"\n[{idx}/{len(fetched_packages)}] Processing Package: {package_name}")
         validation_report["total_candidate_versions"] += len(candidate_versions)
 
-        # Get requirements.txt version for this package
         normalized_name = package_name.lower().replace('_', '-')
         requirements_version = None
         if normalized_name in original_versions:
             _, requirements_version = original_versions[normalized_name]
-            print(f"   📋 Requirements.txt version: {requirements_version}")
+            print(f"   📋 Requirements version: {requirements_version}")
 
-        # Check if we have a test script for this package
-        if package_name not in package_test_scripts:
-            # No test script (no API calls) - but still need to validate installability
-            print(f"   ⚠️ No test script found for {package_name}")
-            print(f"   🔧 Will validate installability of {len(candidate_versions)} versions (no API testing)")
+        api_logs = api_by_package.get(package_name, [])
+        compatible_versions = []
 
-            # Create a minimal test script that only checks if the package can be imported
+        if not api_logs:
+            print(f"   ⚠️ No API logs found. Validating installability only.")
+
+            # Convert PyPI package name to Python import name
+            import_name = pypi_to_import_name(package_name)
+            print(f"   📦 PyPI package: {package_name} → Python import: {import_name}")
+
             minimal_test_script = f"""#!/usr/bin/env python3
 import sys
 try:
-    import {package_name}
+    import {import_name}
     print("SUCCESS")
     sys.exit(0)
-except ImportError as e:
-    # Some packages use different import names, that's OK
-    # As long as installation succeeded, we consider it valid
+except ImportError:
     print("SUCCESS")
     sys.exit(0)
 except Exception as e:
     print(f"FAILED: {{e}}")
     sys.exit(1)
 """
+            process_args = [
+                (package_name, v, minimal_test_script, python_version, timeout, requirements_file)
+                for v in candidate_versions
+            ]
 
-            # Test installation for each version
-            print(f"\n   🧪 Testing installability...")
-            compatible_versions = []
+            print(f"   🚀 Testing {len(candidate_versions)} versions in parallel...")
+            with multiprocessing.Pool(processes=num_processes) as pool:
+                results = pool.map(_mp_worker_test_version, process_args)
+
             incompatible_count = 0
+            installable_count = 0
 
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # Submit all tasks
-                future_to_version = {
-                    executor.submit(
-                        test_version_with_uv,
-                        package_name,
-                        version,
-                        minimal_test_script,
-                        python_version,
-                        timeout
-                    ): version
-                    for version in candidate_versions
-                }
+            for i, (version, is_compatible, error_msg) in enumerate(results, 1):
+                if is_compatible:
+                    compatible_versions.append(version)
+                    installable_count += 1
+                else:
+                    incompatible_count += 1
 
-                # Process results as they complete
-                for i, future in enumerate(as_completed(future_to_version), 1):
-                    version = future_to_version[future]
-
-                    try:
-                        is_compatible, error_msg = future.result()
-
-                        if is_compatible:
-                            compatible_versions.append(version)
-                            if i % 10 == 0 or i == len(candidate_versions):
-                                print(f"   [{i}/{len(candidate_versions)}] {version} ✅ (installable: {len(compatible_versions)})")
-                        else:
-                            incompatible_count += 1
-                            # Check if it's an installation failure (package not found)
-                            if error_msg and ("No matching distribution" in error_msg or
-                                            "Could not find a version" in error_msg or
-                                            "no version of" in error_msg.lower()):
-                                if i % 10 == 0 or i == len(candidate_versions):
-                                    print(f"   [{i}/{len(candidate_versions)}] {version} ❌ (not installable)")
-
-                    except Exception as e:
-                        incompatible_count += 1
-
-            print(f"\n   ✅ Found {len(compatible_versions)} installable versions")
-            print(f"   ❌ Filtered out {incompatible_count} non-installable versions")
-
-            # Always keep at least the requirements.txt version if validation fails
             if not compatible_versions and requirements_version:
-                print(f"   ⚠️ No versions passed validation, keeping requirements.txt version: {requirements_version}")
+                print(f"   ⚠️ All install tests failed, keeping requirements version: {requirements_version}")
                 compatible_versions = [requirements_version]
             elif not compatible_versions:
-                print(f"   ⚠️ No versions passed validation, keeping all {len(candidate_versions)} as fallback")
+                print(f"   ⚠️ All install tests failed, keeping all candidate versions as fallback")
                 compatible_versions = candidate_versions
+            else:
+                print(f"   ✅ Found {len(compatible_versions)} installable versions")
 
             validated_packages[package_name] = compatible_versions
             validation_report["total_compatible_versions"] += len(compatible_versions)
-
-            # Collect statistics for packages without API calls
             validation_report["total_pypi_versions"] += len(candidate_versions)
             validation_report["total_script_passed_versions"] += len(compatible_versions)
 
@@ -746,182 +681,162 @@ except Exception as e:
                 "status": "no_api_calls_installability_tested",
                 "retry_count": 0,
                 "pypi_versions": len(candidate_versions),
-                "installable_versions": len(compatible_versions),
+                "installable_versions": installable_count,
                 "script_passed_versions": len(compatible_versions)
             }
-            continue
 
-        # Get pre-generated test script
-        test_script = package_test_scripts[package_name]
-        print(f"   ✅ Using pre-generated test script")
+        else:
+            print(f"   📝 Found {len(api_logs)} API logs. Generating LLM test scripts...")
+            
+            retry_count = 0
+            error_reason = None
+            best_results = []
 
-        # Retry logic for inference failures
-        compatible_versions = None
-        error_reason = None
-        retry_count = 0
+            for attempt in range(max_retries):
+                retry_count = attempt
+                print(f"   🔄 Attempt {attempt + 1}/{max_retries}: Generating script & Testing versions...")
 
-        pkg_stats = None
-        for attempt in range(max_retries):
-            retry_count = attempt
-            print(f"   🔄 Attempt {attempt + 1}/{max_retries}: Validating {len(candidate_versions)} versions...")
+                test_script_content = generate_test_script_with_llm(package_name, api_logs)
 
-            # Validate versions with script-based testing (using pre-generated script)
-            compatible_versions, error_reason, pkg_stats = validate_package_versions_with_scripts(
-                package_name,
-                test_script,  # Pass pre-generated test script
-                candidate_versions,
-                python_version=python_version,
-                max_workers=max_workers,
-                timeout=timeout,
-                requirements_version=requirements_version
-            )
+                process_args = [
+                    (package_name, v, test_script_content, python_version, timeout, requirements_file)
+                    for v in candidate_versions
+                ]
 
-            if error_reason:
-                # Critical error occurred (e.g., test script failed on requirements version)
-                print(f"   ❌ Critical error: {error_reason}")
-                print(f"   📌 Returning only requirements.txt version")
-                break
+                with multiprocessing.Pool(processes=num_processes) as pool:
+                    results = pool.map(_mp_worker_test_version, process_args)
+
+                temp_compatible = []
+                temp_req_error = None
+                for v, is_compat, err in results:
+                    if is_compat:
+                        temp_compatible.append(v)
+                    else:
+                        if v == requirements_version:
+                            temp_req_error = err
+
+                best_results = results
+
+                if temp_compatible:
+                    compatible_versions = temp_compatible
+                    print(f"   ✅ Attempt {attempt + 1} succeeded: Found {len(compatible_versions)} valid versions")
+                    break
+                else:
+                    print(f"   ❌ Attempt {attempt + 1} failed: No valid versions found.")
+                    if temp_req_error:
+                        error_reason = temp_req_error
+
+            incompatible_count = 0
+            installable_count = 0
+
+            for v, is_compat, err in best_results:
+                if is_compat:
+                    installable_count += 1
+                else:
+                    incompatible_count += 1
+                    # 尝试区分 "安装失败" 和 "安装成功但脚本报错"
+                    if err and not ("No matching distribution" in err or "Could not find a version" in err):
+                        installable_count += 1
 
             if compatible_versions:
-                # Success! Found compatible versions
-                print(f"   ✅ Attempt {attempt + 1} succeeded: Found {len(compatible_versions)} compatible versions")
-                break
+                validated_packages[package_name] = compatible_versions
+                validation_report["validated_packages"] += 1
+                validation_report["total_compatible_versions"] += len(compatible_versions)
+                validation_report["total_pypi_versions"] += len(candidate_versions)
+                validation_report["total_script_passed_versions"] += len(compatible_versions)
+
+                validation_report["packages"][package_name] = {
+                    "candidate_versions": len(candidate_versions),
+                    "compatible_versions": len(compatible_versions),
+                    "filtered_count": incompatible_count,
+                    "status": "validated_success",
+                    "retry_count": retry_count + 1,
+                    "error_reason": None,
+                    "pypi_versions": len(candidate_versions),
+                    "installable_versions": installable_count,
+                    "script_passed_versions": len(compatible_versions)
+                }
             else:
-                # Failed this attempt
-                if attempt + 1 < max_retries:
-                    print(f"   ❌ Attempt {attempt + 1} failed: No compatible versions found. Retrying...")
-                    # Regenerate test script for next attempt
-                    print(f"   🔄 Regenerating test script for retry attempt {attempt + 2}...")
-                    api_calls = api_by_package[package_name]
-                    test_script = generate_test_script_with_llm(package_name, api_calls)
-                    package_test_scripts[package_name] = test_script
+                print(f"   ⚠️ Validation failed after {max_retries} attempts.")
+                if requirements_version:
+                    print(f"   📌 Keeping only requirements version: {requirements_version}")
+                    validated_packages[package_name] = [requirements_version]
+                    validation_report["total_compatible_versions"] += 1
+                    validation_report["total_pypi_versions"] += len(candidate_versions)
+
+                    if error_reason:
+                        validation_report["requirements_version_failures"].append(
+                            (package_name, requirements_version, error_reason)
+                        )
+
+                    validation_report["packages"][package_name] = {
+                        "candidate_versions": len(candidate_versions),
+                        "compatible_versions": 1,
+                        "filtered_count": len(candidate_versions) - 1,
+                        "status": "validation_failed_kept_requirements_version_only",
+                        "retry_count": max_retries,
+                        "error_reason": "all_retries_failed_keeping_requirements_txt_version_only",
+                        "pypi_versions": len(candidate_versions),
+                        "installable_versions": installable_count,
+                        "script_passed_versions": 0
+                    }
                 else:
-                    print(f"   ❌ All {max_retries} attempts failed. Keeping requirements.txt version.")
+                    print(f"   📌 Keeping all {len(candidate_versions)} versions as fallback")
+                    validated_packages[package_name] = candidate_versions
+                    validation_report["total_compatible_versions"] += len(candidate_versions)
+                    validation_report["total_pypi_versions"] += len(candidate_versions)
 
-        if compatible_versions:
-            # Found compatible versions through validation
-            validated_packages[package_name] = compatible_versions
-            validation_report["validated_packages"] += 1
-            validation_report["total_compatible_versions"] += len(compatible_versions)
+                    validation_report["packages"][package_name] = {
+                        "candidate_versions": len(candidate_versions),
+                        "compatible_versions": len(candidate_versions),
+                        "filtered_count": 0,
+                        "status": "validation_failed_no_requirements_version_kept_all",
+                        "retry_count": max_retries,
+                        "error_reason": "no_requirements_version_available_keeping_all_pypi_versions",
+                        "pypi_versions": len(candidate_versions),
+                        "installable_versions": installable_count,
+                        "script_passed_versions": 0
+                    }
 
-            status = "validated_success"
-            if error_reason:
-                status = f"error_{error_reason}"
-
-            # Collect statistics
-            if pkg_stats:
-                validation_report["total_pypi_versions"] += pkg_stats.get("pypi_versions", 0)
-                validation_report["total_script_passed_versions"] += pkg_stats.get("script_passed_versions", 0)
-                # Track requirements.txt version failures
-                if pkg_stats.get("requirements_version_failed") and requirements_version:
-                    validation_report["requirements_version_failures"].append(
-                        (package_name, requirements_version, pkg_stats.get("requirements_version_error"))
-                    )
-
-            validation_report["packages"][package_name] = {
-                "candidate_versions": len(candidate_versions),
-                "compatible_versions": len(compatible_versions),
-                "filtered_count": len(candidate_versions) - len(compatible_versions),
-                "status": status,
-                "retry_count": retry_count + 1,
-                "error_reason": error_reason if error_reason else None,
-                "pypi_versions": pkg_stats.get("pypi_versions", 0) if pkg_stats else 0,
-                "installable_versions": len(candidate_versions),  # All tested versions were installable
-                "script_passed_versions": pkg_stats.get("script_passed_versions", 0) if pkg_stats else 0
-            }
-        else:
-            # FIXED: All retries failed - only keep requirements.txt version
-            # Reason: If validation fails repeatedly, we can only trust the original requirements.txt version
-            print(f"   ⚠️ Validation failed after {max_retries} attempts!")
-            if requirements_version:
-                print(f"   📌 Keeping only requirements.txt version: {requirements_version}")
-                print(f"   💡 Reason: Validation failed, only trusting the original specified version")
-                validated_packages[package_name] = [requirements_version]
-                validation_report["total_compatible_versions"] += 1
-
-                # Update total statistics
-                validation_report["total_pypi_versions"] += len(candidate_versions)
-                # CHANGED: Don't force script_passed_versions to 1, keep it as 0 (real data)
-                validation_report["total_script_passed_versions"] += 0  # No versions actually passed
-
-                validation_report["packages"][package_name] = {
-                    "candidate_versions": len(candidate_versions),
-                    "compatible_versions": 1,
-                    "filtered_count": len(candidate_versions) - 1,
-                    "status": "validation_failed_kept_requirements_version_only",
-                    "retry_count": max_retries,
-                    "error_reason": "all_retries_failed_keeping_requirements_txt_version_only",
-                    "pypi_versions": len(candidate_versions),
-                    "installable_versions": len(candidate_versions),
-                    "script_passed_versions": 0  # Real data: no versions passed script validation
-                }
-            else:
-                print(f"   ❌ No requirements.txt version available!")
-                print(f"   📌 Keeping all {len(candidate_versions)} candidate versions as fallback")
-                validated_packages[package_name] = candidate_versions
-                validation_report["total_compatible_versions"] += len(candidate_versions)
-
-                # Update total statistics
-                validation_report["total_pypi_versions"] += len(candidate_versions)
-                # Note: total_script_passed_versions is not updated because no versions actually passed
-
-                validation_report["packages"][package_name] = {
-                    "candidate_versions": len(candidate_versions),
-                    "compatible_versions": len(candidate_versions),
-                    "filtered_count": 0,
-                    "status": "validation_failed_no_requirements_version_kept_all",
-                    "retry_count": max_retries,
-                    "error_reason": "no_requirements_version_available_keeping_all_pypi_versions",
-                    "pypi_versions": len(candidate_versions),
-                    "installable_versions": len(candidate_versions),
-                    "script_passed_versions": 0  # No versions actually passed script validation
-                }
-
-    # Save results
     output_data = {
-        "mode": resolved_data.get("mode", "unknown"),
-        "resolved_packages": validated_packages,
-        "resolved_packages_enhanced": resolved_data.get("resolved_packages_enhanced", {}),
+        "validated_packages": validated_packages,
         "total_packages": len(validated_packages),
-        "generated_at": resolved_data.get("generated_at", "unknown"),
-        "validated_at": __import__('datetime').datetime.now().isoformat(),
+        "validated_at": datetime.datetime.now().isoformat(),
         "validation_report": validation_report
     }
-
-    with open(output_file, 'w') as f:
-        json.dump(output_data, f, indent=4)
 
     print("\n" + "=" * 70)
     print("📊 VALIDATION SUMMARY")
     print("=" * 70)
     print(f"Python version: {python_version}")
-    print(f"Total packages: {validation_report['total_packages']}")
-    print(f"Successfully validated: {validation_report['validated_packages']}")
+    print(f"Total packages processed: {validation_report['total_packages']}")
+    print(f"Successfully validated (API logic): {validation_report['validated_packages']}")
     print(f"Candidate versions (before): {validation_report['total_candidate_versions']}")
     print(f"Compatible versions (after): {validation_report['total_compatible_versions']}")
     filtered = validation_report['total_candidate_versions'] - validation_report['total_compatible_versions']
-    print(f"Filtered out: {filtered} ({100*filtered/max(1, validation_report['total_candidate_versions']):.1f}%)")
-    print(f"\n✅ Validated versions saved to: {output_file}")
+    if validation_report['total_candidate_versions'] > 0:
+        print(f"Filtered out: {filtered} ({100*filtered/validation_report['total_candidate_versions']:.1f}%)")
     print("=" * 70)
+
+    return output_data
 
 
 def main():
     """Main entry point."""
 
     if len(sys.argv) < 3:
-        print("Usage: python script_based_validator.py <api_calls.json> <resolved_versions.json> [output.json] [python_version] [max_workers] [timeout] [requirements.txt]")
+        print("Usage: python script_based_validator.py <api_calls.json> <resolved_versions.json> [python_version] [max_workers] [timeout] [requirements.txt]")
         print("\nExample:")
-        print("  python script_based_validator.py .venv/.api_calls.json resolved_versions.json validated_versions.json 3.10 auto 30 requirements.txt")
+        print("  python script_based_validator.py .venv/.api_calls.json resolved_versions.json 3.11 auto 30 requirements.txt")
         print("\nNote: Use 'auto' for max_workers to use min(32, cpu_count())")
         sys.exit(1)
 
     api_calls_file = sys.argv[1]
     resolved_versions_file = sys.argv[2]
-    output_file = sys.argv[3] if len(sys.argv) > 3 else "validated_versions.json"
-    python_version = sys.argv[4] if len(sys.argv) > 4 else "3.10"
+    python_version = sys.argv[3] if len(sys.argv) > 3 else "3.11"
 
     # Handle max_workers: support 'auto' or specific number
-    max_workers_arg = sys.argv[5] if len(sys.argv) > 5 else "auto"
+    max_workers_arg = sys.argv[4] if len(sys.argv) > 4 else "auto"
     if max_workers_arg.lower() == "auto":
         cpu_count = multiprocessing.cpu_count()
         max_workers = min(32, cpu_count)
@@ -929,8 +844,8 @@ def main():
     else:
         max_workers = int(max_workers_arg)
 
-    timeout = int(sys.argv[6]) if len(sys.argv) > 6 else 30
-    requirements_file = sys.argv[7] if len(sys.argv) > 7 else None
+    timeout = int(sys.argv[5]) if len(sys.argv) > 5 else 30
+    requirements_file = sys.argv[6] if len(sys.argv) > 6 else None
 
     if not os.path.exists(api_calls_file):
         print(f"❌ Error: {api_calls_file} not found")
@@ -940,15 +855,17 @@ def main():
         print(f"❌ Error: {resolved_versions_file} not found")
         sys.exit(1)
 
-    validate_all_packages_with_scripts(
+    # Call the function and get the result
+    result = validate_all_packages_with_scripts(
         api_calls_file,
         resolved_versions_file,
-        output_file,
         python_version,
         max_workers,
         timeout,
         requirements_file
     )
+
+    print("\n✅ Validation completed. Result returned in-memory (not saved to file).")
 
 
 if __name__ == "__main__":
