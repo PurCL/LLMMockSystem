@@ -1,0 +1,71 @@
+{
+  "package": "keras",
+  "total_apis": 4,
+  "successful_checks": 4,
+  "failed_checks": 0,
+  "success_rate": "100.0%",
+  "passed_api_ids": [
+    "1",
+    "2",
+    "3",
+    "4"
+  ],
+  "failed_api_ids": [],
+  "details": [
+    {
+      "api_id": "1",
+      "api": "keras.layers.Input",
+      "caller": "unknown",
+      "args": [],
+      "kwargs": {
+        "shape": [
+          {
+            "type": "literal",
+            "value": 10
+          }
+        ],
+        "name": "input"
+      },
+      "valid": true,
+      "message": "API signature is valid"
+    },
+    {
+      "api_id": "2",
+      "api": "keras.layers.TFSMLayer",
+      "caller": "unknown",
+      "args": [
+        "savedmodel_path"
+      ],
+      "kwargs": {
+        "call_endpoint": "serving_default"
+      },
+      "valid": true,
+      "message": "API signature is valid"
+    },
+    {
+      "api_id": "3",
+      "api": "keras.models.Model",
+      "caller": "unknown",
+      "args": [],
+      "kwargs": {
+        "inputs": "input_layer",
+        "outputs": "output"
+      },
+      "valid": true,
+      "message": "API signature is valid"
+    },
+    {
+      "api_id": "4",
+      "api": "keras.models.load_model",
+      "caller": "unknown",
+      "args": [
+        "malicious_model.keras"
+      ],
+      "kwargs": {
+        "safe_mode": true
+      },
+      "valid": true,
+      "message": "API signature is valid"
+    }
+  ]
+}

@@ -1,0 +1,195 @@
+{
+  "package": "tensorflow",
+  "total_apis": 14,
+  "successful_checks": 13,
+  "failed_checks": 1,
+  "success_rate": "92.9%",
+  "passed_api_ids": [
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "8",
+    "9",
+    "10",
+    "11",
+    "12",
+    "13",
+    "14"
+  ],
+  "failed_api_ids": [
+    "7"
+  ],
+  "details": [
+    {
+      "api_id": "1",
+      "api": "tensorflow.sparse.to_dense",
+      "caller": "keras.models.load_model -> keras.models.load_model -> keras.src.utils.file_utils.copy -> keras.src.backend.torch.core.convert_to_tensor -> tensorflow.sparse.to_dense",
+      "args": [
+        "x"
+      ],
+      "kwargs": {},
+      "valid": true,
+      "message": "Valid with warnings: Import \"tensorflow.sparse\" could not be resolved from source"
+    },
+    {
+      "api_id": "2",
+      "api": "tensorflow.is_tensor",
+      "caller": "keras.models.load_model -> keras.models.load_model -> keras.src.utils.file_utils.copy -> keras.src.backend.torch.core.convert_to_tensor -> tensorflow.is_tensor",
+      "args": [
+        "x"
+      ],
+      "kwargs": {},
+      "valid": true,
+      "message": "API signature is valid"
+    },
+    {
+      "api_id": "3",
+      "api": "tensorflow.convert_to_tensor",
+      "caller": "keras.models.load_model -> keras.models.load_model -> keras.src.utils.file_utils.copy -> keras.src.backend.torch.core.convert_to_tensor -> tensorflow.convert_to_tensor",
+      "args": [
+        "x"
+      ],
+      "kwargs": {},
+      "valid": true,
+      "message": "API signature is valid"
+    },
+    {
+      "api_id": "4",
+      "api": "tensorflow.convert_to_tensor",
+      "caller": "keras.models.load_model -> keras.models.load_model -> keras.src.utils.file_utils.copy -> keras.src.backend.torch.core.convert_to_tensor -> tensorflow.convert_to_tensor",
+      "args": [
+        "x"
+      ],
+      "kwargs": {
+        "dtype": "dtype"
+      },
+      "valid": true,
+      "message": "API signature is valid"
+    },
+    {
+      "api_id": "5",
+      "api": "tensorflow.cast",
+      "caller": "keras.models.load_model -> keras.models.load_model -> keras.src.utils.file_utils.copy -> keras.src.backend.torch.core.convert_to_tensor -> tensorflow.cast",
+      "args": [
+        "x",
+        "dtype"
+      ],
+      "kwargs": {},
+      "valid": true,
+      "message": "API signature is valid"
+    },
+    {
+      "api_id": "6",
+      "api": "tensorflow.cast",
+      "caller": "keras.models.load_model -> keras.models.load_model -> keras.src.utils.file_utils.copy -> keras.src.backend.torch.core.convert_to_tensor -> tensorflow.cast",
+      "args": [
+        "x"
+      ],
+      "kwargs": {
+        "dtype": "dtype"
+      },
+      "valid": true,
+      "message": "API signature is valid"
+    },
+    {
+      "api_id": "7",
+      "api": "tensorflow.experimental.numpy.copy",
+      "caller": "keras.models.load_model -> keras.models.load_model -> keras.src.utils.file_utils.copy -> tensorflow.experimental.numpy.copy",
+      "args": [
+        "x"
+      ],
+      "kwargs": {},
+      "valid": false,
+      "message": "Type errors: Import \"tensorflow.experimental.numpy\" could not be resolved"
+    },
+    {
+      "api_id": "8",
+      "api": "tensorflow.IndexedSlices",
+      "caller": "keras.models.load_model -> keras.models.load_model -> keras.src.utils.file_utils.copy -> keras.src.backend.jax.sparse.elementwise_unary -> tensorflow.IndexedSlices",
+      "args": [
+        "func(...)",
+        "x.indices",
+        "x.dense_shape"
+      ],
+      "kwargs": {},
+      "valid": true,
+      "message": "API signature is valid"
+    },
+    {
+      "api_id": "9",
+      "api": "tensorflow.sparse.reshape",
+      "caller": "keras.models.load_model -> keras.models.load_model -> keras.src.utils.file_utils.copy -> keras.src.backend.torch.core.convert_to_tensor -> keras.src.utils.tree.flatten -> keras.src.utils.module_utils.tensorflow.reshape -> tensorflow.sparse.reshape",
+      "args": [
+        "x",
+        "newshape"
+      ],
+      "kwargs": {},
+      "valid": true,
+      "message": "Valid with warnings: Import \"tensorflow.sparse\" could not be resolved from source"
+    },
+    {
+      "api_id": "10",
+      "api": "tensorflow.reshape",
+      "caller": "keras.models.load_model -> keras.models.load_model -> keras.src.utils.file_utils.copy -> keras.src.backend.torch.core.convert_to_tensor -> keras.src.utils.tree.flatten -> keras.src.utils.module_utils.tensorflow.reshape -> tensorflow.reshape",
+      "args": [
+        "x",
+        "newshape"
+      ],
+      "kwargs": {},
+      "valid": true,
+      "message": "API signature is valid"
+    },
+    {
+      "api_id": "11",
+      "api": "tensorflow.constant",
+      "caller": "keras.models.load_model -> keras.models.load_model -> keras.src.utils.file_utils.copy -> keras.src.backend.torch.core.convert_to_tensor -> keras.src.backend.common.standardize_dtype -> keras.src.backend.common.dtypes.PYTHON_DTYPES_MAP.get -> keras.src.dtype_policies.dtype_policy.dtype_policy -> keras.src.dtype_policies.get -> keras.src.saving.serialization_lib.deserialize_keras_object -> keras.src.backend.convert_to_tensor -> keras.src.backend.tensorflow.sparse.sparse_to_dense -> tensorflow.constant",
+      "args": [
+        "default_value"
+      ],
+      "kwargs": {
+        "dtype": "x.dtype"
+      },
+      "valid": true,
+      "message": "API signature is valid"
+    },
+    {
+      "api_id": "12",
+      "api": "tensorflow.reshape",
+      "caller": "keras.models.load_model -> keras.models.load_model -> keras.src.utils.file_utils.copy -> keras.src.backend.torch.core.convert_to_tensor -> keras.src.backend.common.standardize_dtype -> keras.src.backend.common.dtypes.PYTHON_DTYPES_MAP.get -> keras.src.dtype_policies.dtype_policy.dtype_policy -> keras.src.dtype_policies.get -> keras.src.saving.serialization_lib.deserialize_keras_object -> keras.src.backend.convert_to_tensor -> keras.src.backend.tensorflow.sparse.sparse_to_dense -> tensorflow.reshape",
+      "args": [
+        "x.values",
+        []
+      ],
+      "kwargs": {},
+      "valid": true,
+      "message": "API signature is valid"
+    },
+    {
+      "api_id": "13",
+      "api": "tensorflow.sparse.to_dense",
+      "caller": "keras.models.load_model -> keras.models.load_model -> keras.src.utils.file_utils.copy -> keras.src.backend.torch.core.convert_to_tensor -> keras.src.backend.common.standardize_dtype -> keras.src.backend.common.dtypes.PYTHON_DTYPES_MAP.get -> keras.src.dtype_policies.dtype_policy.dtype_policy -> keras.src.dtype_policies.get -> keras.src.saving.serialization_lib.deserialize_keras_object -> keras.src.backend.convert_to_tensor -> keras.src.backend.tensorflow.sparse.sparse_to_dense -> tensorflow.sparse.to_dense",
+      "args": [
+        "x"
+      ],
+      "kwargs": {
+        "default_value": "default_value"
+      },
+      "valid": true,
+      "message": "Valid with warnings: Import \"tensorflow.sparse\" could not be resolved from source"
+    },
+    {
+      "api_id": "14",
+      "api": "tensorflow.identity",
+      "caller": "keras.models.load_model -> keras.models.load_model -> keras.src.utils.file_utils.copy -> tensorflow.identity",
+      "args": [
+        "x"
+      ],
+      "kwargs": {},
+      "valid": true,
+      "message": "API signature is valid"
+    }
+  ]
+}
