@@ -5,12 +5,14 @@ This script automates the process of:
 1. Extracting library calls from a script
 2. Verifying package version compatibility (包含trace功能)
 3. Recursively processing newly discovered APIs until depth limit reached
+4. Extracting version compatibility results
+5. Running end-to-end verification tests
 
 Usage:
-    python3 run_recursive_api_analysis.py <script_path> <api_log_dir>
+    python3 run_recursive_api_analysis.py <script_path> --CVE <cve_id>
 
 Example:
-    python3 run_recursive_api_analysis.py /path/to/run_exploit.sh /path/to/api_log
+    python3 run_recursive_api_analysis.py /path/to/run_exploit.sh --CVE CVE-2026-1462
 """
 
 import os
@@ -20,19 +22,74 @@ import subprocess
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 import shutil
+import time
+import requests
 
 
 class RecursiveAPIAnalyzer:
     """Main controller for recursive API analysis pipeline"""
 
-    def __init__(self, script_path: str, api_log_dir: str, max_depth: int = 10):
+    def __init__(self, script_path: str, cve_id: str, max_depth: int = 10, package: str = None, versions: List[str] = None, vulnerable_packages: Dict[str, List[str]] = None):
         self.script_path = Path(script_path).absolute()
-        self.api_log_dir = Path(api_log_dir).absolute()
+        self.cve_id = cve_id
+        self.api_log_dir = Path(f"{cve_id}_api_log").absolute()
         self.max_depth = max_depth
         self.base_dir = Path(__file__).parent.absolute()
+        self.package = package
+        self.versions = versions
+        self.vulnerable_packages = vulnerable_packages or {}
 
         # Track processed directories to avoid infinite loops
         self.processed_dirs = set()
+
+        # Load PyPI import mapping
+        self.pypi_import_mapping = self._load_pypi_import_mapping(
+            str(self.base_dir / "pypi_import_mapping.json")
+        )
+
+    def _load_pypi_import_mapping(self, mapping_file: str) -> Dict[str, str]:
+        """Load PyPI import mapping"""
+        if not os.path.exists(mapping_file):
+            print(f"Warning: pypi_import_mapping.json not found at {mapping_file}")
+            return {}
+
+        try:
+            with open(mapping_file, "r", encoding="utf-8") as f:
+                original_mapping = json.load(f)
+
+            # Reverse mapping: {import_name: pypi_package_name}
+            reversed_mapping = {}
+            for pypi_name, import_name in original_mapping.items():
+                reversed_mapping[import_name] = pypi_name
+
+            print(f"[Mapping Loader] Loaded {len(reversed_mapping)} package mappings from {mapping_file}")
+            return reversed_mapping
+        except Exception as e:
+            print(f"Warning: Failed to load mapping file {mapping_file}: {e}")
+            return {}
+
+    def get_pypi_package_name(self, import_name: str) -> str:
+        """
+        Get package name on PyPI (may differ from import name)
+
+        Args:
+            import_name: Name used when importing in Python (case-sensitive)
+                        Example: 'PIL', 'OpenSSL', 'cv2'
+
+        Returns:
+            Package name on PyPI (used for pip install and PyPI API queries)
+            Example: 'Pillow', 'pyOpenSSL', 'opencv-python'
+
+        Note:
+            If not found in mapping, returns original import_name
+            No case conversion or - to _ replacement is performed
+        """
+        if import_name in self.pypi_import_mapping:
+            pypi_name = self.pypi_import_mapping[import_name]
+            print(f"[Mapping] Using PyPI package name '{pypi_name}' for import name '{import_name}'")
+            return pypi_name
+        # Return original name without any conversion
+        return import_name
 
     def run_command(self, cmd: List[str], description: str, cwd: Path = None) -> Tuple[bool, str, str]:
         """Execute a shell command and return success status and output"""
@@ -115,6 +172,17 @@ class RecursiveAPIAnalyzer:
             str(self.base_dir / 'verify_compatible_package_versions.py'),
             str(api_file)
         ]
+
+        # Get PyPI package name for version matching
+        pypi_package_name = self.get_pypi_package_name(package_name)
+
+        # Check if this is the specific package and add --versions parameter
+        # First check vulnerable_packages dict, then fall back to package/versions
+        # Use pypi_package_name for matching
+        if self.vulnerable_packages and pypi_package_name in self.vulnerable_packages:
+            cmd.extend(['--versions'] + self.vulnerable_packages[pypi_package_name])
+        elif self.package and self.versions and pypi_package_name == self.package:
+            cmd.extend(['--versions'] + self.versions)
 
         success, stdout, stderr = self.run_command(
             cmd,
@@ -273,40 +341,213 @@ class RecursiveAPIAnalyzer:
 
 
 def main():
-    if len(sys.argv) < 3:
-        print("Usage: python3 run_recursive_api_analysis.py <script_path> <api_log_dir> [max_depth]")
-        print()
-        print("Arguments:")
-        print("  script_path  - Path to the script to analyze (e.g., run_exploit.sh)")
-        print("  api_log_dir  - Directory to store API logs")
-        print("  max_depth    - Optional: Maximum recursion depth (default: 10)")
-        print()
-        print("Example:")
-        print("  python3 run_recursive_api_analysis.py \\")
-        print("    /home/user/run_exploit.sh \\")
-        print("    /home/user/pyright/api_log")
-        print()
-        print("Description:")
-        print("  This script automates the entire API analysis pipeline:")
-        print("  1. Extracts library calls from the target script")
-        print("  2. Verifies version compatibility for each library (包含trace功能)")
-        print("  3. Recursively processes newly discovered APIs")
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Recursive API Analysis Pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Example:
+  python3 run_recursive_api_analysis.py /home/user/run_exploit.sh --CVE CVE-2026-1462
+  python3 run_recursive_api_analysis.py /home/user/run_exploit.sh --CVE CVE-2026-1462 --max_depth 5
+  python3 run_recursive_api_analysis.py /home/user/run_exploit.sh --CVE CVE-2026-1462 --package keras --versions 2.10.0 2.9.0
+  python3 run_recursive_api_analysis.py /home/user/run_exploit.sh --CVE CVE-2026-1462 --vulnerable-file /path/to/vulnerable.json
+
+Description:
+  This script automates the entire API analysis pipeline:
+  1. Extracts library calls from the target script
+  2. Verifies version compatibility for each library (包含trace功能)
+  3. Recursively processes newly discovered APIs
+  4. Extracts version compatibility results to {CVE}-compatibility.json
+  5. Records timing statistics to {CVE}-statistics.json
+  6. Runs end-to-end verification tests and saves results to {CVE}-exploit_test_results.json
+
+  The API logs will be automatically stored in {CVE}_api_log directory.
+        """
+    )
+
+    parser.add_argument('script_path', type=str, help='Path to the script to analyze (e.g., run_exploit.sh)')
+    parser.add_argument('--CVE', type=str, required=True, help='CVE identifier (e.g., CVE-2026-1462)')
+    parser.add_argument('--max_depth', type=int, default=10, help='Maximum recursion depth (default: 10)')
+    parser.add_argument('--package', type=str, help='Specific package name to apply version filtering')
+    parser.add_argument('--versions', nargs='+', type=str, help='List of versions to test for the specified package')
+    parser.add_argument('--vulnerable-file', type=str, help='Path to JSON file containing vulnerable packages (format: {"package": ["version1", "version2"]})')
+
+    args = parser.parse_args()
+
+    # Validate parameter constraints
+    # --package and --versions must appear together
+    if (args.package is not None) != (args.versions is not None):
+        print(f"❌ Error: --package and --versions must be used together")
         sys.exit(1)
 
-    script_path = sys.argv[1]
-    api_log_dir = sys.argv[2]
-    max_depth = int(sys.argv[3]) if len(sys.argv) > 3 else 10
+    # --package/--versions and --vulnerable-file are mutually exclusive
+    if (args.package is not None or args.versions is not None) and args.vulnerable_file is not None:
+        print(f"❌ Error: --package/--versions and --vulnerable-file are mutually exclusive")
+        sys.exit(1)
 
     # Validate inputs
-    if not Path(script_path).exists():
-        print(f"❌ Error: Script not found: {script_path}")
+    if not Path(args.script_path).exists():
+        print(f"❌ Error: Script not found: {args.script_path}")
         sys.exit(1)
 
+    # Load vulnerable packages from JSON file if provided
+    vulnerable_packages = None
+    if args.vulnerable_file:
+        vulnerable_file_path = Path(args.vulnerable_file)
+        if not vulnerable_file_path.exists():
+            print(f"❌ Error: Vulnerable file not found: {args.vulnerable_file}")
+            sys.exit(1)
+
+        try:
+            with open(vulnerable_file_path, 'r', encoding='utf-8') as f:
+                vulnerable_packages = json.load(f)
+
+            # Validate JSON structure
+            if not isinstance(vulnerable_packages, dict):
+                print(f"❌ Error: Vulnerable file must contain a JSON object (dict)")
+                sys.exit(1)
+
+            for pkg, versions in vulnerable_packages.items():
+                if not isinstance(versions, list):
+                    print(f"❌ Error: Versions for package '{pkg}' must be a list")
+                    sys.exit(1)
+
+            print(f"✓ Loaded {len(vulnerable_packages)} vulnerable packages from {args.vulnerable_file}")
+
+        except json.JSONDecodeError as e:
+            print(f"❌ Error: Failed to parse JSON file: {e}")
+            sys.exit(1)
+        except Exception as e:
+            print(f"❌ Error: Failed to read vulnerable file: {e}")
+            sys.exit(1)
+
+    # Start timing
+    start_time = time.time()
+
     # Create analyzer and run
-    analyzer = RecursiveAPIAnalyzer(script_path, api_log_dir, max_depth)
+    analyzer = RecursiveAPIAnalyzer(
+        args.script_path,
+        args.CVE,
+        args.max_depth,
+        args.package,
+        args.versions,
+        vulnerable_packages
+    )
     success = analyzer.run()
 
-    sys.exit(0 if success else 1)
+    if not success:
+        print("\n❌ RecursiveAPIAnalyzer failed")
+        sys.exit(1)
+
+    # Run extract_version_compatibility.py
+    print(f"\n{'#'*80}")
+    print("Running extract_version_compatibility.py")
+    print(f"{'#'*80}")
+
+    compatibility_output = f"{args.CVE}-compatibility.json"
+    extract_cmd = [
+        'python3',
+        'extract_version_compatibility.py',
+        str(analyzer.api_log_dir),
+        compatibility_output
+    ]
+
+    print(f"Command: {' '.join(extract_cmd)}")
+    try:
+        result = subprocess.run(
+            extract_cmd,
+            capture_output=True,
+            text=True,
+            cwd=str(Path(__file__).parent.absolute()),
+            timeout=1800
+        )
+
+        if result.stdout:
+            print(result.stdout)
+        if result.stderr:
+            print("STDERR:", result.stderr, file=sys.stderr)
+
+        if result.returncode != 0:
+            print(f"\n❌ extract_version_compatibility.py failed with return code {result.returncode}")
+            sys.exit(1)
+
+        print(f"✓ Successfully generated {compatibility_output}")
+
+    except Exception as e:
+        print(f"\n❌ Error running extract_version_compatibility.py: {e}")
+        sys.exit(1)
+
+    # Record elapsed time
+    elapsed_time = time.time() - start_time
+
+    # Save statistics
+    statistics_output = f"{args.CVE}-statistics.json"
+    statistics = {
+        "CVE": args.CVE,
+        "script_path": str(args.script_path),
+        "api_log_dir": str(analyzer.api_log_dir),
+        "elapsed_time_seconds": elapsed_time,
+        "elapsed_time_formatted": f"{elapsed_time:.2f}s"
+    }
+
+    try:
+        with open(statistics_output, 'w', encoding='utf-8') as f:
+            json.dump(statistics, f, indent=2, ensure_ascii=False)
+        print(f"\n✓ Statistics saved to {statistics_output}")
+        print(f"Total elapsed time: {elapsed_time:.2f} seconds")
+    except Exception as e:
+        print(f"\n⚠️ Warning: Failed to save statistics: {e}")
+
+    # Run end_to_end_verify_version_combinations.py
+    print(f"\n{'#'*80}")
+    print("Running end_to_end_verify_version_combinations.py")
+    print(f"{'#'*80}")
+
+    exploit_test_output = f"{args.CVE}-exploit_test_results.json"
+    verify_cmd = [
+        'python3',
+        'end_to_end_verify_version_combinations.py',
+        args.script_path,
+        compatibility_output,
+        '-n', '10',
+        '-o', exploit_test_output
+    ]
+
+    print(f"Command: {' '.join(verify_cmd)}")
+    try:
+        result = subprocess.run(
+            verify_cmd,
+            capture_output=True,
+            text=True,
+            cwd=str(Path(__file__).parent.absolute()),
+            timeout=3600  # 1 hour timeout for testing
+        )
+
+        if result.stdout:
+            print(result.stdout)
+        if result.stderr:
+            print("STDERR:", result.stderr, file=sys.stderr)
+
+        if result.returncode != 0:
+            print(f"\n❌ end_to_end_verify_version_combinations.py failed with return code {result.returncode}")
+            sys.exit(1)
+
+        print(f"✓ Successfully generated {exploit_test_output}")
+
+    except Exception as e:
+        print(f"\n❌ Error running end_to_end_verify_version_combinations.py: {e}")
+        sys.exit(1)
+
+    print(f"\n{'#'*80}")
+    print("ALL STEPS COMPLETED SUCCESSFULLY!")
+    print(f"{'#'*80}")
+    print(f"Generated files:")
+    print(f"  - {compatibility_output}")
+    print(f"  - {statistics_output}")
+    print(f"  - {exploit_test_output}")
+
+    sys.exit(0)
 
 
 if __name__ == "__main__":

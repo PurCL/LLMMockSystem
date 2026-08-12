@@ -24,6 +24,10 @@ import tempfile
 import shutil
 import random
 import time
+import re
+import multiprocessing
+import requests
+from packaging.version import parse as parse_version
 
 
 def load_pypi_import_mapping(mapping_file="pypi_import_mapping.json"):
@@ -51,6 +55,669 @@ def load_pypi_import_mapping(mapping_file="pypi_import_mapping.json"):
 # Load PyPI import mapping at module level
 SCRIPT_DIR = Path(__file__).parent
 PYPI_IMPORT_MAPPING = load_pypi_import_mapping(str(SCRIPT_DIR / "pypi_import_mapping.json"))
+
+
+def parse_import_error(stderr: str) -> Optional[Dict[str, str]]:
+    """
+    Parse ImportError from stderr, extract error type, missing library, missing item, and call chain
+
+    Example input:
+    ImportError: cannot import name 'ContextOverflowError' from 'langchain_core.exceptions'
+
+    Returns:
+    {
+        'error_type': 'ImportError',
+        'package': 'langchain_core',
+        'missing_item': 'ContextOverflowError',
+        'call_chain': ['langchain_openai', 'langchain_core']
+    }
+    """
+    if not stderr:
+        return None
+
+    # Get the last line (usually the actual error message)
+    lines = stderr.strip().split('\n')
+    last_line = lines[-1] if lines else ''
+
+    # Regex match: ImportError: cannot import name 'XXX' from 'YYY'
+    pattern_import_error = r"ImportError:\s*cannot import name\s+'([^']+)'\s+from\s+'([^']+)'"
+    match_import = re.search(pattern_import_error, last_line)
+
+    # Regex match: ModuleNotFoundError: No module named 'XXX'
+    pattern_module_not_found = r"ModuleNotFoundError:\s*No module named\s+'([^']+)'"
+    match_module = re.search(pattern_module_not_found, last_line)
+
+    error_type = None
+    missing_item = None
+    full_module = None
+    package = None
+
+    # Handle ImportError
+    if match_import:
+        error_type = 'ImportError'
+        missing_item = match_import.group(1)
+        full_module = match_import.group(2)
+        # Extract package name (part before the first dot)
+        package = full_module.split('.')[0]
+    # Handle ModuleNotFoundError
+    elif match_module:
+        error_type = 'ModuleNotFoundError'
+        missing_module = match_module.group(1)
+        # For ModuleNotFoundError, missing_item is the module name itself
+        missing_item = missing_module
+        full_module = missing_module
+        package = missing_module.split('.')[0]
+    else:
+        return None
+
+    # Analyze call chain
+    call_chain = []
+
+    # Find all "File" lines, extract import paths or package names from file paths
+    file_pattern = r'File\s+"([^"]+)"'
+    import_pattern = r'(from\s+(\S+)\s+import|import\s+(\S+))'
+    site_packages_pattern = r'/site-packages/([^/]+)/'
+
+    # Iterate through each line of the traceback
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        file_match = re.search(file_pattern, line)
+
+        if file_match:
+            file_path = file_match.group(1)
+            package_from_file = None
+
+            # Try to extract package name from file path (part after site-packages)
+            site_match = re.search(site_packages_pattern, file_path)
+            if site_match:
+                package_from_file = site_match.group(1)
+                # Handle special cases like PIL -> pillow
+                # Here we directly use the folder name
+                if package_from_file and package_from_file not in call_chain:
+                    call_chain.append(package_from_file)
+
+            # Check if the next line contains an import statement
+            if i + 1 < len(lines):
+                next_line = lines[i + 1]
+                import_match = re.search(import_pattern, next_line)
+
+                if import_match:
+                    # Extract the imported package name
+                    if import_match.group(2):  # from X import
+                        imported_module = import_match.group(2)
+                    elif import_match.group(3):  # import X
+                        imported_module = import_match.group(3)
+                    else:
+                        imported_module = None
+
+                    if imported_module:
+                        # Extract top-level package name
+                        top_package = imported_module.split('.')[0]
+
+                        # Add to call chain (avoid duplicates)
+                        if not call_chain or call_chain[-1] != top_package:
+                            call_chain.append(top_package)
+
+        i += 1
+
+    # For ModuleNotFoundError, the missing module should be the last item in the call chain
+    if error_type == 'ModuleNotFoundError':
+        # Ensure the missing module is at the end of the call chain
+        if call_chain and call_chain[-1] != package:
+            call_chain.append(package)
+        elif not call_chain:
+            # If the call chain is empty, find the second-to-last package
+            # Find the caller from site-packages paths
+            for i in range(len(lines) - 1, -1, -1):
+                line = lines[i]
+                file_match = re.search(file_pattern, line)
+                if file_match:
+                    file_path = file_match.group(1)
+                    site_match = re.search(site_packages_pattern, file_path)
+                    if site_match:
+                        caller_package = site_match.group(1)
+                        if caller_package != package:
+                            call_chain = [caller_package, package]
+                            break
+
+            # If still can't find, at least add the target package
+            if not call_chain:
+                call_chain = [package]
+    else:
+        # For ImportError, if the call chain is empty, at least add the last package
+        if not call_chain:
+            call_chain = [package]
+
+    return {
+        'error_type': error_type,
+        'package': package,
+        'missing_item': missing_item,
+        'full_module': full_module,
+        'call_chain': call_chain
+    }
+
+
+def fetch_all_versions(package_name: str) -> List[str]:
+    """
+    Fetch all available versions of a package from PyPI (sorted in descending order)
+
+    Args:
+        package_name: package import_name (case-sensitive)
+                     Example: 'OpenSSL', 'PIL', 'numpy'
+
+    Returns:
+        Standardized version list (descending order, newest first)
+        Special characters like / and : in version numbers are replaced with _
+
+    Note:
+        - Input package_name is import_name, will be converted to pypi_name via mapping
+        - Versions are sorted according to semantic versioning rules (using packaging.version.parse)
+    """
+    # Convert package name to PyPI name
+    def get_pypi_name(pkg_name: str) -> str:
+        if pkg_name in PYPI_IMPORT_MAPPING:
+            return PYPI_IMPORT_MAPPING[pkg_name]
+        return pkg_name
+
+    try:
+        # Get PyPI package name via mapping (if exists)
+        pypi_package_name = get_pypi_name(package_name)
+        url = f"https://pypi.org/pypi/{pypi_package_name}/json"
+        response = requests.get(url, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+
+        # Get all versions
+        raw_versions = list(data.get('releases', {}).keys())
+
+        # Sort in descending order using packaging.version.parse
+        # reverse=True means from newest to oldest (e.g., 2.10.0 -> 2.9.0 -> 1.0.0)
+        sorted_versions = sorted(raw_versions, key=parse_version, reverse=True)
+
+        # Standardize version numbers: replace special characters with underscores
+        safe_versions = [version.replace('/', '_').replace(':', '_') for version in sorted_versions]
+
+        print(f"Found {len(raw_versions)} total versions for {pypi_package_name}. Standardized and returning the top {len(safe_versions)} latest versions.")
+
+        return safe_versions
+
+    except Exception as e:
+        print(f"Error fetching versions for {package_name}: {e}", file=sys.stderr)
+        return []
+
+
+def fetch_package_versions_by_call_chain(package_name: str, call_chain: List[str], compatibility_data: Dict, combo: Dict[str, str] = None) -> Tuple[List[str], bool]:
+    """
+    Fetch package versions from compatibility.json following the call_chain path
+
+    Args:
+        package_name: PyPI package name (target package)
+        call_chain: Call chain list, e.g., ['langchain_openai', 'langchain_core']
+        compatibility_data: Loaded compatibility data
+        combo: Version combination dict to specify version for each package in call_chain
+
+    Returns:
+        (Version list in descending order, whether this is a new package)
+    """
+    versions_set = set()
+
+    # Convert package name to PyPI name
+    def get_pypi_name(pkg_name: str) -> str:
+        if pkg_name in PYPI_IMPORT_MAPPING:
+            return PYPI_IMPORT_MAPPING[pkg_name]
+        return pkg_name
+
+    target_pypi_name = get_pypi_name(package_name)
+
+    # Convert all package names in call_chain to PyPI names
+    pypi_call_chain = [get_pypi_name(pkg) for pkg in call_chain]
+
+    print(f"[*] Following call chain to find versions: {' -> '.join(pypi_call_chain)}")
+
+    # Navigate to the target package following the call_chain path
+    current_data = compatibility_data
+
+    for i, chain_package in enumerate(pypi_call_chain[:-1]):  # Iterate through all packages except the last one
+        if not isinstance(current_data, dict):
+            print(f"[!] Data is not a dict at chain level {i} (package: {chain_package})")
+            return [], False
+
+        # Find the package in the current chain
+        if chain_package in current_data:
+            # Get all version data for this package
+            package_versions = current_data[chain_package]
+
+            if not isinstance(package_versions, dict):
+                print(f"[!] No version data found for {chain_package} in call chain")
+                return [], False
+
+            target_version = combo[chain_package]
+            current_data = package_versions[target_version]
+            print(f"[*] Using combo version: {chain_package}=={target_version}")
+        else:
+            print(f"[!] Package {chain_package} not found in call chain at level {i}")
+            return [], False
+
+    # Now current_data should point to the dependency dict of the second-to-last package in call_chain
+    # We need to extract versions of the last package (target package) from here
+    last_package = pypi_call_chain[-1]
+
+    # Access the dictionary directly, no need for loops and recursion
+    if isinstance(current_data, dict) and last_package in current_data:
+        target_package_data = current_data[last_package]
+
+        if isinstance(target_package_data, dict):
+            for version in target_package_data:  # Iterate through dict keys
+                if version != 'incompatible':
+                    versions_set.add(version)
+
+    is_new_package = False
+    if not versions_set:
+        # If no versions found, try fetching from PyPI API
+        print(f"[*] No versions found in compatibility data, fetching from PyPI...")
+        all_versions = fetch_all_versions(package_name)
+        if all_versions:
+            versions_set = set(all_versions)
+            is_new_package = True
+            print(f"[*] This is a new package not in compatibility data")
+
+    # Convert to list and sort in descending order by version number
+    sorted_versions = sorted(list(versions_set), key=parse_version, reverse=True)
+    print(f"[*] Found {len(sorted_versions)} versions for {package_name} following call chain")
+    return sorted_versions, is_new_package
+
+
+def verify_single_version(args: Tuple) -> Tuple[str, bool, str]:
+    """
+    Verify whether a single version contains the specified item in an isolated environment
+
+    Args:
+        args: (package_name, version, missing_item, full_module, work_dir)
+
+    Returns:
+        (version, success, error_message)
+    """
+    package_name, version, missing_item, full_module, work_dir = args
+
+    # Create version-specific directory
+    version_dir = os.path.join(work_dir, f"verify_{package_name}_{version.replace('/', '_').replace(':', '_')}")
+
+    try:
+        os.makedirs(version_dir, exist_ok=True)
+
+        # Create virtual environment
+        venv_path = os.path.join(version_dir, 'venv')
+        result = subprocess.run(
+            [sys.executable, '-m', 'venv', venv_path],
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+
+        if result.returncode != 0:
+            return (version, False, f"Failed to create venv: {result.stderr}")
+
+        # Install package
+        pip_path = os.path.join(venv_path, 'bin', 'pip')
+        result = subprocess.run(
+            [pip_path, 'install', f'{package_name}=={version}'],
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+
+        if result.returncode != 0:
+            return (version, False, f"Failed to install: {result.stderr[:200]}")
+
+        # Create test script - use full module path
+        test_script = os.path.join(version_dir, 'test_import.py')
+        script_content = f"""
+import sys
+try:
+    from {full_module} import {missing_item}
+    print("SUCCESS: Found {missing_item}")
+    sys.exit(0)
+except ImportError as e:
+    print(f"FAILED: {{e}}")
+    sys.exit(1)
+except Exception as e:
+    print(f"ERROR: {{e}}")
+    sys.exit(2)
+"""
+
+        with open(test_script, 'w') as f:
+            f.write(script_content)
+
+        # Run test script
+        python_path = os.path.join(venv_path, 'bin', 'python')
+        result = subprocess.run(
+            [python_path, test_script],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+
+        success = (result.returncode == 0)
+        message = result.stdout.strip() if result.stdout else result.stderr.strip()
+
+        return (version, success, message)
+
+    except subprocess.TimeoutExpired:
+        return (version, False, "Timeout")
+    except Exception as e:
+        return (version, False, str(e))
+    finally:
+        # Cleanup
+        if os.path.exists(version_dir):
+            try:
+                shutil.rmtree(version_dir)
+            except:
+                pass
+
+
+def remove_failed_versions_from_call_chain(
+    compatibility_data: Dict,
+    call_chain: List[str],
+    failed_versions: List[str],
+    target_package: str,
+    combo: Dict[str, str] = None
+) -> None:
+    """
+    Remove all failed_versions of target_package along the call chain path from compatibility_data
+
+    Args:
+        compatibility_data: Compatibility data (will be modified directly)
+        call_chain: Call chain list, e.g., ['langchain_openai', 'langchain_core']
+        failed_versions: List of versions to remove
+        target_package: Target package name (import name)
+        combo: Version combination dict to specify version for each package in call_chain
+    """
+    # Convert package name to PyPI name
+    def get_pypi_name(pkg_name: str) -> str:
+        if pkg_name in PYPI_IMPORT_MAPPING:
+            return PYPI_IMPORT_MAPPING[pkg_name]
+        return pkg_name
+
+    target_pypi_name = get_pypi_name(target_package)
+    pypi_call_chain = [get_pypi_name(pkg) for pkg in call_chain]
+
+    print(f"[*] Removing versions {failed_versions} for {target_pypi_name} along call chain: {' -> '.join(pypi_call_chain)}")
+
+    # Navigate to the location in the call chain and delete failed versions
+    current_data = compatibility_data
+
+    for i, chain_package in enumerate(pypi_call_chain[:-1]):
+        if not isinstance(current_data, dict):
+            print(f"[!] Cannot navigate: data is not a dict at chain level {i}")
+            return
+
+        if chain_package not in current_data:
+            print(f"[!] Package {chain_package} not found in call chain at level {i}")
+            return
+
+        package_versions = current_data[chain_package]
+
+        if not isinstance(package_versions, dict):
+            print(f"[!] No version data for {chain_package}")
+            return
+
+        target_version = combo[chain_package]
+        current_data = package_versions[target_version]
+        print(f"[*] Navigating to {chain_package}=={target_version} (from combo)")
+
+    # Now delete failed versions of the last package
+    last_package = pypi_call_chain[-1]
+
+    if isinstance(current_data, dict) and last_package in current_data:
+        target_versions_dict = current_data[last_package]
+
+        if isinstance(target_versions_dict, dict):
+            for ver in failed_versions:
+                if ver in target_versions_dict:
+                    del target_versions_dict[ver]
+                    print(f"[*] Removed version {ver} from {last_package}")
+
+
+def add_successful_versions_from_call_chain(
+    compatibility_data: Dict,
+    call_chain: List[str],
+    successful_versions: List[str],
+    target_package: str,
+    combo: Dict[str, str] = None
+) -> None:
+    """
+    Add all successful_versions of target_package along the call chain path to compatibility_data
+
+    Args:
+        compatibility_data: Compatibility data (will be modified directly)
+        call_chain: Call chain list, e.g., ['langchain_openai', 'langchain_core']
+        successful_versions: List of versions to add
+        target_package: Target package name (import name)
+        combo: Version combination dict to specify version for each package in call_chain
+    """
+    # Convert package name to PyPI name
+    def get_pypi_name(pkg_name: str) -> str:
+        if pkg_name in PYPI_IMPORT_MAPPING:
+            return PYPI_IMPORT_MAPPING[pkg_name]
+        return pkg_name
+
+    target_pypi_name = get_pypi_name(target_package)
+    pypi_call_chain = [get_pypi_name(pkg) for pkg in call_chain]
+
+    print(f"[*] Adding versions {successful_versions} for {target_pypi_name} along call chain: {' -> '.join(pypi_call_chain)}")
+
+    # Navigate to the location in the call chain and add successful versions
+    current_data = compatibility_data
+
+    for i, chain_package in enumerate(pypi_call_chain[:-1]):
+        if not isinstance(current_data, dict):
+            print(f"[!] Cannot navigate: data is not a dict at chain level {i}")
+            return
+
+        if chain_package not in current_data:
+            print(f"[!] Package {chain_package} not found in call chain at level {i}")
+            return
+
+        package_versions = current_data[chain_package]
+
+        if not isinstance(package_versions, dict):
+            print(f"[!] No version data for {chain_package}")
+            return
+
+        target_version = combo[chain_package]
+        if target_version not in package_versions:
+            print(f"[!] Version {target_version} not found for {chain_package}")
+            return
+
+        current_data = package_versions[target_version]
+        print(f"[*] Navigating to {chain_package}=={target_version} (from combo)")
+
+    # Now add successful versions of the last package
+    last_package = pypi_call_chain[-1]
+
+    # If the target package doesn't exist, create it
+    if last_package not in current_data:
+        current_data[last_package] = {}
+        print(f"[*] Created new entry for {last_package}")
+
+    target_versions_dict = current_data[last_package]
+
+    if not isinstance(target_versions_dict, dict):
+        print(f"[!] Target versions dict is not a dict for {last_package}")
+        return
+
+    # Add all successful versions (with empty dict as value)
+    for ver in successful_versions:
+        if ver not in target_versions_dict:
+            target_versions_dict[ver] = {}
+            print(f"[*] Added version {ver} to {last_package}")
+        else:
+            print(f"[*] Version {ver} already exists in {last_package}")
+
+
+def verify_single_version_installability(args: Tuple) -> Tuple[str, bool, str]:
+    """
+    Verify whether a single version can be installed (for newly added packages)
+
+    Args:
+        args: (package_name, version, work_dir)
+
+    Returns:
+        (version, success, error_message)
+    """
+    package_name, version, work_dir = args
+
+    # Create version-specific directory
+    version_dir = os.path.join(work_dir, f"install_check_{package_name}_{version.replace('/', '_').replace(':', '_')}")
+
+    try:
+        os.makedirs(version_dir, exist_ok=True)
+
+        # Create virtual environment
+        venv_path = os.path.join(version_dir, 'venv')
+        result = subprocess.run(
+            [sys.executable, '-m', 'venv', venv_path],
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+
+        if result.returncode != 0:
+            return (version, False, f"Failed to create venv: {result.stderr}")
+
+        # Try to install package
+        success = install_package(venv_path, package_name, version, max_retries=1)
+
+        if success:
+            return (version, True, f"Successfully installed {package_name}=={version}")
+        else:
+            return (version, False, f"Failed to install {package_name}=={version}")
+
+    except subprocess.TimeoutExpired:
+        return (version, False, "Timeout")
+    except Exception as e:
+        return (version, False, str(e))
+    finally:
+        # Cleanup
+        if os.path.exists(version_dir):
+            try:
+                shutil.rmtree(version_dir)
+            except:
+                pass
+
+
+def verify_package_versions_for_missing_item(
+    package_name: str,
+    missing_item: str,
+    test_dir: str,
+    full_module: str = None,
+    max_workers: int = 10,
+    compatibility_data: Dict = None,
+    call_chain: List[str] = None,
+    combo: Dict[str, str] = None
+) -> Tuple[List[str], bool]:
+    """
+    Verify all versions of a package in parallel to find versions that don't contain the specified item
+
+    Args:
+        package_name: Package name
+        missing_item: Missing class/function name
+        test_dir: Test directory
+        full_module: Full module path (e.g., langchain_core.exceptions)
+        max_workers: Maximum number of parallel workers
+        compatibility_data: compatibility.json data (if provided, fetch versions from it)
+        call_chain: Call chain list (if provided, fetch versions following the call chain)
+        combo: Version combination dict to specify version for each package in call_chain
+
+    Returns:
+        (List of failed versions or list of successfully installed versions, whether this is a new package)
+    """
+    # If full module path not provided, use package name
+    if full_module is None:
+        full_module = package_name.replace('-', '_')
+
+    print(f"\n[*] Fetching versions for {package_name}...")
+
+    versions, is_new_package = fetch_package_versions_by_call_chain(package_name, call_chain, compatibility_data, combo)
+
+    if not versions:
+        print(f"[!] No versions found for {package_name}")
+        return [], False
+
+    # Create verification working directory
+    verify_work_dir = os.path.join(test_dir, f"verify_{package_name}")
+    os.makedirs(verify_work_dir, exist_ok=True)
+
+    result_versions = []
+
+    if not is_new_package:
+        # Existing package: test which versions don't contain missing_item
+        print(f"[*] Testing {len(versions)} versions for presence of '{missing_item}' in '{full_module}'...")
+
+        # Prepare arguments
+        args_list = [
+            (package_name, version, missing_item, full_module, verify_work_dir)
+            for version in versions
+        ]
+
+        # Execute verification in parallel
+        try:
+            with multiprocessing.Pool(processes=max_workers) as pool:
+                results = pool.map(verify_single_version, args_list)
+
+            # Collect failed versions
+            for version, success, message in results:
+                if not success:
+                    result_versions.append(version)
+                    print(f"  [✗] {package_name}=={version}: {message[:100]}")
+                else:
+                    print(f"  [✓] {package_name}=={version}: {message}")
+
+        except KeyboardInterrupt:
+            print("\n[!] Verification interrupted by user")
+            pool.terminate()
+            pool.join()
+        except Exception as e:
+            print(f"[!] Error during verification: {e}")
+    else:
+        # New package: test which versions can be successfully installed
+        print(f"[*] Testing {len(versions)} versions for installability (new package)...")
+
+        # Prepare arguments
+        args_list = [
+            (package_name, version, verify_work_dir)
+            for version in versions
+        ]
+
+        # Execute installation verification in parallel
+        try:
+            with multiprocessing.Pool(processes=max_workers) as pool:
+                results = pool.map(verify_single_version_installability, args_list)
+
+            # Collect successfully installed versions
+            for version, success, message in results:
+                if success:
+                    result_versions.append(version)
+                    print(f"  [✓] {package_name}=={version}: {message}")
+                else:
+                    print(f"  [✗] {package_name}=={version}: {message[:100]}")
+
+        except KeyboardInterrupt:
+            print("\n[!] Verification interrupted by user")
+            pool.terminate()
+            pool.join()
+        except Exception as e:
+            print(f"[!] Error during verification: {e}")
+
+    # Cleanup working directory
+    if os.path.exists(verify_work_dir):
+        try:
+            shutil.rmtree(verify_work_dir)
+        except:
+            pass
+
+    return result_versions, is_new_package
 
 
 def load_compatibility_file(filepath: str) -> Dict:
@@ -136,8 +803,8 @@ def select_package_versions(compatibility_data: Dict,
                                 return False
                     return True
 
-            # Get available versions list
-            versions = list(available_versions.keys())
+            # Get available versions list (filter out 'incompatible' key)
+            versions = [v for v in available_versions.keys() if v != 'incompatible']
 
             if not versions:
                 # No versions available
@@ -208,37 +875,6 @@ def select_package_versions(compatibility_data: Dict,
     return None
 
 
-def generate_version_combinations(compatibility_data: Dict,
-                                  mode: str = 'random',
-                                  count: int = 1) -> List[Dict[str, str]]:
-    """Generate multiple valid version combinations"""
-    combinations = []
-    seen_combinations = set()
-
-    attempts = 0
-    max_total_attempts = count * 100
-
-    while len(combinations) < count and attempts < max_total_attempts:
-        attempts += 1
-
-        version_combo = select_package_versions(compatibility_data, mode, max_total_attempts)
-
-        if version_combo:
-            # Create a hashable representation
-            combo_key = tuple(sorted(version_combo.items()))
-
-            if combo_key not in seen_combinations:
-                seen_combinations.add(combo_key)
-                combinations.append(version_combo)
-                print(f"[*] Generated combination {len(combinations)}/{count}")
-
-    if len(combinations) == 0:
-        print(f"\n[!] Could not generate any valid combinations after {attempts} attempts")
-        print(f"[!] The compatibility constraints may be too restrictive or conflicting")
-    elif len(combinations) < count:
-        print(f"\n[!] Warning: Only generated {len(combinations)} combinations out of {count} requested")
-
-    return combinations
 
 
 def create_virtual_environment(venv_path: str) -> bool:
@@ -430,14 +1066,12 @@ def run_exploit_script(venv_path: str, exploit_script: str, work_dir: str) -> Tu
             timeout=300  # 5 minute timeout
         )
 
-        output = f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}\n\nReturn code: {result.returncode}"
-
         if result.returncode == 0:
             print(f"[+] Exploit script completed successfully (exit code 0)")
-            return True, output
+            return True, result.stdout, result.stderr, result.returncode
         else:
             print(f"[-] Exploit script failed with exit code {result.returncode}")
-            return False, output
+            return False, result.stdout, result.stderr, result.returncode
 
     except subprocess.TimeoutExpired:
         error_msg = "Exploit script timed out after 5 minutes"
@@ -451,7 +1085,8 @@ def run_exploit_script(venv_path: str, exploit_script: str, work_dir: str) -> Tu
 
 def test_version_combination(exploit_script: str,
                             version_combo: Dict[str, str],
-                            work_dir: str) -> Dict:
+                            work_dir: str,
+                            compatibility_data: Dict = None) -> Dict:
     """Test a single version combination by creating venv and running exploit"""
     result = {
         'version_combination': version_combo.copy(),
@@ -460,6 +1095,9 @@ def test_version_combination(exploit_script: str,
         'success': False,
         'error': None,
         'exploit_output': None,
+        'stdout': None,
+        'stderr': None,
+        'returncode': None,
         'timestamp': datetime.now().isoformat()
     }
 
@@ -499,9 +1137,13 @@ def test_version_combination(exploit_script: str,
             return result
 
         # Run exploit script
-        exploit_success, exploit_output = run_exploit_script(venv_path, exploit_script, work_dir)
+        exploit_success, stdout, stderr, returncode = run_exploit_script(venv_path, exploit_script, work_dir)
+        exploit_output = f"STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}\n\nReturn code: {returncode}"
         result['exploit_output'] = exploit_output
         result['success'] = exploit_success
+        result['stdout'] = stdout
+        result['stderr'] = stderr
+        result['returncode'] = returncode
 
         if exploit_success:
             print(f"[+] Successfully triggered the exploit!")
@@ -566,38 +1208,7 @@ def main():
         print("[!] No compatibility data found in file", file=sys.stderr)
         sys.exit(1)
 
-    # Check for incompatible packages
-    incompatible_packages = check_for_incompatible_packages(compatibility_data)
-    if incompatible_packages:
-        print("\n" + "="*70, file=sys.stderr)
-        print("INCOMPATIBLE PACKAGES FOUND", file=sys.stderr)
-        print("="*70, file=sys.stderr)
-        print(f"\n[!] Cannot find suitable versions for the following package(s):", file=sys.stderr)
-        for pkg in incompatible_packages:
-            print(f"    - {pkg} (marked as incompatible)", file=sys.stderr)
-        print(f"\n[!] The compatibility file indicates these packages have no compatible versions.", file=sys.stderr)
-        print(f"[!] Compatibility file: {args.compatibility}", file=sys.stderr)
-        print(f"\n[*] Exiting without running tests.", file=sys.stderr)
-        sys.exit(1)
-
-    # Generate version combinations
-    print(f"\n[*] Generating {args.count} version combination(s) using '{args.mode}' mode...")
-    combinations = generate_version_combinations(compatibility_data, args.mode, args.count)
-
-    if not combinations:
-        print("\n" + "="*70, file=sys.stderr)
-        print("NO VALID COMBINATIONS FOUND", file=sys.stderr)
-        print("="*70, file=sys.stderr)
-        print("\n[!] No valid version combinations could be generated.", file=sys.stderr)
-        print("[!] This may be because:", file=sys.stderr)
-        print("    - The compatibility file has conflicting version constraints", file=sys.stderr)
-        print("    - All available versions are marked as incompatible", file=sys.stderr)
-        print("    - The dependency tree cannot be satisfied", file=sys.stderr)
-        print(f"\n[*] Compatibility file: {args.compatibility}", file=sys.stderr)
-        print(f"[*] Number of root packages: {len(compatibility_data)}", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"\n[*] Starting tests for {len(combinations)} version combination(s)")
+    print(f"\n[*] Starting tests for {args.count} version combination(s) using '{args.mode}' mode")
     print(f"[*] Exploit: {args.exploit}")
     print(f"[*] Compatibility: {args.compatibility}")
     print(f"[*] Mode: {args.mode}")
@@ -612,9 +1223,46 @@ def main():
     successful_combinations = []
     successful_results = []
     failed_combinations = []
+    seen_combinations = set()
 
-    for i, combo in enumerate(combinations, 1):
-        print(f"\n[*] Testing combination {i}/{len(combinations)}")
+    max_attempts_per_combo = 100  # Maximum attempts to generate a unique combo
+
+    while len(results) < args.count:
+        i = len(results) + 1
+        print(f"\n[*] Testing combination {i}/{args.count}")
+
+        # Generate a unique version combination
+        combo = None
+        attempts = 0
+        while attempts < max_attempts_per_combo:
+            attempts += 1
+            temp_combo = select_package_versions(compatibility_data, args.mode, max_total_attempts=100)
+
+            if temp_combo is None:
+                print(f"[!] Failed to generate a valid combination (attempt {attempts}/{max_attempts_per_combo})")
+                if attempts == max_attempts_per_combo:
+                    print(f"[!] Could not generate a valid combination after {max_attempts_per_combo} attempts")
+                    print("[!] This may be because:", file=sys.stderr)
+                    print("    - The compatibility file has conflicting version constraints", file=sys.stderr)
+                    print("    - All available versions are marked as incompatible", file=sys.stderr)
+                    print("    - The dependency tree cannot be satisfied", file=sys.stderr)
+                    break
+                continue
+
+            # Create a hashable representation to check for duplicates
+            combo_key = tuple(sorted(temp_combo.items()))
+
+            if combo_key not in seen_combinations:
+                seen_combinations.add(combo_key)
+                combo = temp_combo
+                print(f"[+] Generated unique combination after {attempts} attempt(s)")
+                break
+            else:
+                print(f"[*] Duplicate combination found, regenerating... (attempt {attempts}/{max_attempts_per_combo})")
+
+        if combo is None:
+            print(f"[!] Skipping test {i} due to failure in generating valid combination")
+            continue
 
         # Create a subdirectory for this test
         test_dir = os.path.join(base_work_dir, f"test_{i}")
@@ -625,7 +1273,67 @@ def main():
                 args.exploit,
                 combo,
                 test_dir,
+                compatibility_data
             )
+
+            if result['error'] == "Exploit failed to trigger":
+                # Parse stderr to get ImportError information
+                stderr_content = result.get('stderr', '')
+                import_error_info = parse_import_error(stderr_content)
+
+                if import_error_info:
+                    print(f"\n[*] Detected ImportError: {import_error_info['error_type']}")
+                    print(f"    Missing: {import_error_info['missing_item']} from {import_error_info['full_module']}")
+                    print(f"    Call chain: {' -> '.join(import_error_info['call_chain'])}")
+
+                    # Verify all versions of this package in parallel
+                    result_versions, is_new_package = verify_package_versions_for_missing_item(
+                        package_name=import_error_info['package'],
+                        missing_item=import_error_info['missing_item'],
+                        full_module=import_error_info['full_module'],
+                        test_dir=test_dir,
+                        compatibility_data=compatibility_data,
+                        call_chain=import_error_info['call_chain'],
+                        combo=combo
+                    )
+
+                    if result_versions:
+                        if not is_new_package:
+                            # Existing package: remove versions that don't contain missing_item
+                            print(f"\n[!] Failed versions for {import_error_info['package']}:")
+                            for ver in result_versions:
+                                print(f"    - {ver}")
+
+                            # Modify compatibility_data to remove failed versions in the call chain
+                            print(f"\n[*] Removing failed versions from compatibility_data along call chain...")
+                            remove_failed_versions_from_call_chain(
+                                compatibility_data,
+                                import_error_info['call_chain'],
+                                result_versions,
+                                import_error_info['package'],
+                                combo
+                            )
+
+                            print(f"[*] Will retry testing this combination after removing failed versions.")
+                        else:
+                            # New package: add versions that can be successfully installed
+                            print(f"\n[+] Successfully installed versions for {import_error_info['package']} (new package):")
+                            for ver in result_versions:
+                                print(f"    - {ver}")
+
+                            # Modify compatibility_data to add successful versions in the call chain
+                            print(f"\n[*] Adding successful versions to compatibility_data along call chain...")
+                            add_successful_versions_from_call_chain(
+                                compatibility_data,
+                                import_error_info['call_chain'],
+                                result_versions,
+                                import_error_info['package'],
+                                combo
+                            )
+
+                            print(f"[*] Will retry testing this combination after adding successful versions.")
+
+                        continue
 
             results.append(result)
 
@@ -667,7 +1375,7 @@ def main():
             'exploit_script': os.path.abspath(args.exploit),
             'compatibility_file': os.path.abspath(args.compatibility),
             'test_timestamp': datetime.now().isoformat(),
-            'total_combinations': len(combinations),
+            'total_combinations': len(results),
             'successful_combinations': len(successful_combinations),
             'failed_combinations': len(failed_combinations),
         },
@@ -680,7 +1388,7 @@ def main():
     print(f"\n{'='*70}")
     print(f"TESTING COMPLETE")
     print(f"{'='*70}")
-    print(f"\n[*] Total combinations tested: {len(combinations)}")
+    print(f"\n[*] Total combinations tested: {len(results)}")
     print(f"[+] Successful exploits: {len(successful_combinations)}")
     print(f"[-] Failed exploits: {len(failed_combinations)}")
 
@@ -695,6 +1403,13 @@ def main():
             print(f"    - {combo}")
 
     print(f"\n[*] Results saved to: {output_file}")
+
+    # Save filtered compatibility_data
+    compatibility_prefix = os.path.splitext(args.compatibility)[0]
+    filtered_output_file = f"{compatibility_prefix}_filtered.json"
+    with open(filtered_output_file, 'w') as f:
+        json.dump(compatibility_data, f, indent=2)
+    print(f"[*] Filtered compatibility data saved to: {filtered_output_file}")
 
     # Cleanup working directory
     if os.path.exists(base_work_dir):

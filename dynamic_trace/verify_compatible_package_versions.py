@@ -3,7 +3,7 @@
 Package Version Compatibility Tester - Refactored Version
 
 Core Design:
-1. API Parsing: Extract API calls/attributes and package name from apis.py file
+1. API Parsing: Extract API calls and package name from apis.py file
 2. Version Fetching: Retrieve all available versions from PyPI
 3. Concurrent Environment Creation: Create isolated venv for each version and install package
 4. API Detection: Use hasattr and inspect.signature to detect which APIs are supported in each venv
@@ -63,6 +63,8 @@ import glob
 import shutil
 from packaging.version import parse as parse_version
 import signal
+import base64
+import pickle
 
 
 # ============================================================
@@ -156,12 +158,6 @@ class APIParser:
                 caller_info = line.replace('# Call chain:', '').strip()
                 if caller_info == 'None':
                     caller_info = 'unknown'
-            elif line.startswith('# Attribute access'):
-                caller_info = line.replace('# Attribute access', '').strip()
-                if caller_info.startswith('('):
-                    caller_info = caller_info[1:-1] if caller_info.endswith(')') else caller_info[1:]
-                if not caller_info or caller_info == 'None':
-                    caller_info = 'attribute access'
 
             i += 1
 
@@ -169,12 +165,10 @@ class APIParser:
         api_call = None
         if i < len(lines):
             call_line = lines[i].strip()
-            is_attribute = (api_type == "attribute")
-            is_import = (api_type == "import")
-            is_decorator = call_line.startswith('@')
+            is_import = (api_type in ["import", "from_import"])
 
-            # For import and attribute, don't parse args/kwargs to prevent AST errors
-            if is_attribute or is_import:
+            # For import and from_import, don't parse args/kwargs to prevent AST errors
+            if is_import:
                 args, kwargs = [], {}
             else:
                 args, kwargs = APIParser._parse_call_line(call_line)
@@ -186,8 +180,6 @@ class APIParser:
                     'args': args,
                     'kwargs': kwargs,
                     'caller': caller_info,
-                    'is_decorator': is_decorator,
-                    'is_attribute': is_attribute,
                     'is_import': is_import,       # New flag
                     'type': api_type              # Record original type for later use
                 }
@@ -930,8 +922,8 @@ class VersionWorker:
                     api_id = api_call.get('api_id')
                     api_path = api_call.get('callee', 'Unknown API')
 
-                    # [New]: Check if current entry is import type, skip analysis directly
-                    if api_call.get('type') == 'import' or api_call.get('is_import'):
+                    # [New]: Check if current entry is import or from_import type, skip analysis directly
+                    if api_call.get('type') in ['import', 'from_import'] or api_call.get('is_import'):
                         continue
 
                     if api_id not in result['supported_api_ids']: # Only analyze APIs in supported_api_ids
@@ -1003,104 +995,135 @@ class VersionWorker:
         """
         Generate Python script for checking single API / Import detection.
         Returns code 0 on success, non-0 on failure. Missing package errors are written to stderr for outer Worker to capture.
-
-        Args:
-            package: import_name (case-sensitive), e.g., 'OpenSSL', 'PIL'
-            api_call: API call information dictionary
-
-        Note:
-            - package parameter is import_name, used for importlib.import_module
-            - No .lower() or - to _ conversion on package
         """
         callee = api_call.get('callee', '')
-        is_attribute = api_call.get('is_attribute', False)
-        is_import = api_call.get('is_import', False)  # New: extract import flag
+        api_type = api_call.get('type', 'call')
+        is_import = api_call.get('is_import', False)
+
         args_py = repr(api_call.get('args', []))
         kwargs_py = repr(api_call.get('kwargs', {}))
 
-        # Build script with f-string, directly hardcode parameters in script, no need for command-line args
-        script_content = f'''#!/usr/bin/env python3
+        script_content = r'''#!/usr/bin/env python3
 import sys
 import inspect
 import importlib
 
-def check_api(api_path: str, is_attribute: bool, is_import: bool, args: list, kwargs: dict) -> tuple:
+def check_api(api_path: str, is_import: bool, api_type: str, args: list, kwargs: dict) -> tuple:
     parts = api_path.split('.')
     if len(parts) < 1:
-        return False, f"Invalid API path: {{api_path}}"
+        return False, f"Invalid API path: {api_path}"
 
     obj = None
 
-    # Try import from longest path to shortest path, solves deep import like keras.models.load_model
-    # Also perfectly supports scenarios like from a.b import c where import target is an object
+    # Try import from longest path to shortest path
     for i in range(len(parts), 0, -1):
         mod_name = '.'.join(parts[:i])
         try:
             obj = importlib.import_module(mod_name)
             for attr in parts[i:]:
-                if not hasattr(obj, attr):
-                    return False, f"Attribute '{{attr}}' not found in {{mod_name}}"
-                obj = getattr(obj, attr)
+                # Strip trailing '()' to support anonymous instantiation syntax parsing
+                clean_attr = attr.replace('()', '')
+                
+                if not hasattr(obj, clean_attr):
+                    return False, f"Attribute '{clean_attr}' not found in {mod_name}"
+                obj = getattr(obj, clean_attr)
             break
 
         except ModuleNotFoundError as e:
-            if e.name == mod_name:
+            if e.name and (mod_name == e.name or mod_name.startswith(e.name + '.')):
                 continue
             # Missing underlying dependency, raise upward
             raise e
 
     if obj is None:
-        return False, f"Could not import any base module for {{api_path}}"
+        return False, f"Could not import any base module for {api_path}"
 
-    # === New: If cross-library import check, success if target object can be resolved ===
-    if is_import:
+    # === If cross-library import or from_import check, success if target object can be resolved ===
+    if is_import or api_type in ["import", "from_import"]:
         return True, "Import successful"
 
-    if is_attribute:
-        return True, "Attribute exists"
-
     if not callable(obj):
-        return False, f"{{api_path}} is not callable"
+        return False, f"{api_path} is not callable"
 
     try:
         sig = inspect.signature(obj)
     except (ValueError, TypeError) as e:
-        return True, f"Cannot inspect signature (assumed compatible): {{e}}"
+        return True, f"Cannot inspect signature (assumed compatible): {e}"
 
     try:
+        # ==============================================================
+        # Intelligently unwrap wrapper layer parameters
+        # ==============================================================
+        if not args and isinstance(kwargs, dict) and 'args' in kwargs and 'kwargs' in kwargs:
+            real_args = kwargs['args']
+            real_kwargs = kwargs['kwargs']
+            
+            if isinstance(real_args, (list, tuple)) and isinstance(real_kwargs, dict):
+                args = real_args
+                kwargs = real_kwargs
+        
+        # Binding test
         sig.bind_partial(*args, **kwargs)
         return True, "API signature matches perfectly"
+        
     except TypeError as e:
-        return False, f"Signature mismatch: {{str(e)}}"
+        # ==============================================================
+        # Core fix: Handle Positional-Only parameters
+        # ==============================================================
+        if "positional only" in str(e):
+            bound_args = list(args)
+            remaining_kwargs = kwargs.copy()
+            
+            for name, param in sig.parameters.items():
+                if param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+                    if name in remaining_kwargs:
+                        bound_args.append(remaining_kwargs.pop(name))
+            try:
+                sig.bind_partial(*bound_args, **remaining_kwargs)
+                return True, "API signature matches (Auto-adjusted for positional-only)"
+            except TypeError as e2:
+                return False, f"Signature mismatch: {str(e2)}"
+                
+        return False, f"Signature mismatch: {str(e)}"
 
 def main():
-    api_path = {repr(callee)}
-    is_attribute = {repr(is_attribute)}
-    is_import = {repr(is_import)}
-    args = {args_py}
-    kwargs = {kwargs_py}
-    
+    api_path = <<<CALLEE>>>
+    is_import = <<<IS_IMPORT>>>
+    api_type = <<<API_TYPE>>>
+    args = <<<ARGS>>>
+    kwargs = <<<KWARGS>>>
+
     try:
-        compatible, message = check_api(api_path, is_attribute, is_import, args, kwargs)
+        compatible, message = check_api(api_path, is_import, api_type, args, kwargs)
         if compatible:
-            print(f"✓ compatible: {{message}}")
-            sys.exit(0)  # Success, return code 0
+            print(f"✓ compatible: {message}")
+            sys.exit(0)
         else:
-            print(f"✗ incompatible: {{message}}")
-            sys.exit(1)  # API incompatible/module not found, return code 1
+            print(f"✗ incompatible: {message}")
+            sys.exit(1)
 
     except ModuleNotFoundError as e:
-        # Format error output to stderr for outer layer regex to capture precisely
-        sys.stderr.write(f"ModuleNotFoundError: No module named '{{e.name}}'\\n")
+        sys.stderr.write(f"ModuleNotFoundError: No module named '{e.name}'\n")
         sys.exit(2)
     except Exception as e:
-        sys.stderr.write(f"Runtime error: {{str(e)}}\\n")
+        sys.stderr.write(f"Runtime error: {str(e)}\n")
         sys.exit(3)
 
 if __name__ == "__main__":
     main()
 '''
-        return script_content
+        # Use chained replacement to safely inject variables
+        return script_content.replace(
+            "<<<CALLEE>>>", repr(callee)
+        ).replace(
+            "<<<IS_IMPORT>>>", repr(is_import)
+        ).replace(
+            "<<<API_TYPE>>>", repr(api_type)
+        ).replace(
+            "<<<ARGS>>>", args_py
+        ).replace(
+            "<<<KWARGS>>>", kwargs_py
+        )
 
     def _run_check_script(
         self,
@@ -1147,164 +1170,230 @@ if __name__ == "__main__":
     ) -> str:
         """
         Generate cross-library call analysis script (Boundary Tracer)
-        Clean version: records all cross-library calls and imports, automatically uses Mock fallback retry when original parameters error.
-        (New: capture underlying cross-library import behavior via sys.addaudithook)
-
-        Args:
-            package: import_name (case-sensitive), e.g., 'OpenSSL', 'keras'
-            api_call: API call information dictionary
-
-        Note:
-            - package parameter is import_name, used for boundary detection
-            - No case conversion on package
         """
+        import base64
+        import pickle
+
         callee = api_call.get('callee', '')
-        args_py = repr(api_call.get('args', []))
-        kwargs_py = repr(api_call.get('kwargs', {}))
+        # Externally serialize and encode parameters to avoid any injection-induced SyntaxError
+        args_b64 = base64.b64encode(pickle.dumps(api_call.get('args', []))).decode('ascii')
+        kwargs_b64 = base64.b64encode(pickle.dumps(api_call.get('kwargs', {}))).decode('ascii')
         
-        script_content = f'''#!/usr/bin/env python3
+        # Removed f-string prefix, allowing normal use of curly braces {} inside
+        script_content = '''#!/usr/bin/env python3
 import sys
 import importlib
 import inspect
 import json
+import base64
+import pickle
 from unittest.mock import MagicMock
 
-def get_api_object(api_path: str):
-    parts = api_path.split('.')
-    obj = None
-    for i in range(len(parts), 0, -1):
-        mod_name = '.'.join(parts[:i])
+def get_api_object(api_path: str, tracer_func=None):
+    def traced_import(mod_name):
+        original_trace = sys.gettrace()
+        if tracer_func:
+            sys.settrace(tracer_func)
         try:
-            obj = importlib.import_module(mod_name)
-            for attr in parts[i:]:
-                obj = getattr(obj, attr)
-            break
-        except ModuleNotFoundError as e:
-            if e.name == mod_name:
-                continue
-            raise e
-    return obj
+            return importlib.import_module(mod_name)
+        finally:
+            if tracer_func:
+                sys.settrace(original_trace)
+
+    parts = api_path.split('.')
+    if len(parts) == 1:
+        return traced_import(parts[0].replace('()', ''))
+
+    for i in range(len(parts) - 1, 0, -1):
+        mod_name = '.'.join(parts[:i])
+        attr_parts = parts[i:]
+        try:
+            obj = traced_import(mod_name)
+            for attr in attr_parts:
+                clean_attr = attr.replace('()', '')
+                obj = getattr(obj, clean_attr)
+            return obj
+        except (ModuleNotFoundError, AttributeError):
+            continue
+            
+    return traced_import(api_path.replace('()', ''))
 
 def safe_repr(val):
-    """Safely convert parameter to string, prevent crash from Tensor or large objects"""
     try:
         val_type = type(val).__name__
-        if "Tensor" in val_type or "Variable" in val_type:
+        if any(keyword in val_type for keyword in ["Tensor", "Variable", "DataFrame", "Series", "ndarray"]):
             shape = getattr(val, 'shape', '?')
             dtype = getattr(val, 'dtype', '?')
-            return f"<{{val_type}}: shape={{{{shape}}}}, dtype={{{{dtype}}}}>"
+            return f"<{val_type}: shape={shape}, dtype={dtype}>"
         s = repr(val)
-        return s[:200] + "..." if len(s) > 200 else s
+        if len(s) > 1000:
+            return s[:1000] + "... <truncated>"
+        return s
     except Exception:
         return "<Unrepresentable Object>"
 
 def generate_mock_kwargs(func_obj):
-    """Generate MagicMock fake parameters based on function signature"""
-    kwargs = {{}}
+    kwargs = {}
     try:
         sig = inspect.signature(func_obj)
         for name, param in sig.parameters.items():
-            if param.default == inspect.Parameter.empty and name not in ('self', 'args', 'kwargs'):
+            if param.default == inspect.Parameter.empty and name not in ('args', 'kwargs'):
                 kwargs[name] = MagicMock()
     except Exception:
         pass
     return kwargs
 
 def main():
-    api_path = {repr(callee)}
-    source_pkg = {repr(package)}
-    args = {args_py}
-    kwargs = {kwargs_py}
+    # Placeholders will be replaced externally by replace()
+    api_path = <<<CALLEE>>>
+    source_pkg = <<<PACKAGE>>>
+    args = pickle.loads(base64.b64decode("<<<ARGS_B64>>>"))
+    kwargs = pickle.loads(base64.b64decode("<<<KWARGS_B64>>>"))
     
     recorded_apis = set()
-    recorded_imports = set()
-
-    # === New: Import Audit Hook ===
-    def import_audit_hook(event, args):
-        if event == "import":
-            module_name = args[0]
-
-            # Trace call stack back to find which actual module initiated this import
-            frame = sys._getframe()
-            caller_mod = ""
-            caller_func = ""
-            while frame:
-                mod = frame.f_globals.get("__name__", "")
-                # Filter out Python underlying importlib mechanism and our own generated main wrapper layer
-                if mod and not mod.startswith("importlib.") and mod not in ("builtins", "__main__"):
-                    caller_mod = mod
-                    caller_func = frame.f_code.co_name
-                    break
-                frame = frame.f_back
-
-            # Boundary discovered! Caller is source_pkg, and target module to import is not source_pkg
-            if caller_mod.startswith(source_pkg) and not module_name.startswith(source_pkg):
-                downstream_pkg = module_name.split('.')[0]
-                import_signature = f"{{caller_mod}} -> {{module_name}}"
-
-                if import_signature not in recorded_imports:
-                    recorded_imports.add(import_signature)
-
-                    import_record = {{
-                        "type": "import",
-                        "downstream_package": downstream_pkg,
-                        "downstream_module": module_name,
-                        "called_by": f"{{caller_mod}}.{{caller_func}}"
-                    }}
-                    # Output dedicated [BOUNDARY_IMPORT] prefix to distinguish from function calls
-                    print(f"[BOUNDARY_IMPORT]{{json.dumps(import_record)}}")
-
-    # Register system-level audit hook
-    sys.addaudithook(import_audit_hook)
-    # ============================================
 
     def tracer(frame, event, arg):
-        if event == 'call':
-            caller_frame = frame.f_back
-            if not caller_frame:
+        if event != 'call':
+            return tracer
+
+        func_name = frame.f_code.co_name
+        if func_name == '<module>':
+            return tracer
+
+        caller_frame = frame.f_back
+        if not caller_frame:
+            return tracer
+
+        caller_mod = caller_frame.f_globals.get("__name__", "")
+        if not caller_mod:
+            return tracer
+
+        # 1. Preserve the actual callee module (for accurate cross-package boundary detection)
+        raw_callee_mod = frame.f_globals.get("__name__", "")
+        if not raw_callee_mod or raw_callee_mod.startswith("namedtuple_"):
+            return tracer
+            
+        # 2. Get downstream_pkg early and filter stdlib (performance optimization: early exit)
+        downstream_pkg = raw_callee_mod.split('.')[0]
+        if downstream_pkg in sys.stdlib_module_names:
+            return tracer
+
+        # 3. Check if caller and callee actually cross package boundaries
+        if caller_mod.startswith(source_pkg) and not raw_callee_mod.startswith(source_pkg):
+            
+            is_instance_method = False
+            cls_obj = None
+
+            if 'self' in frame.f_locals:
+                cls_obj = frame.f_locals['self'].__class__
+                is_instance_method = True
+            elif 'cls' in frame.f_locals:
+                cls_obj = frame.f_locals['cls']
+                if not isinstance(cls_obj, type):
+                    cls_obj = None
+
+            # 4. Dynamically get function object to extract lineage info from __qualname__
+            func_obj_trace = None
+            if cls_obj:
+                func_obj_trace = getattr(cls_obj, func_name, None)
+            else:
+                func_obj_trace = frame.f_globals.get(func_name)
+
+            qualname = getattr(func_obj_trace, '__qualname__', None) if func_obj_trace else None
+
+            # ==========================================================
+            # 🛑 Iron Wall Block 1: Never let any closure pass!
+            # If it's an internal closure function, discard it directly, never let it enter fallback logic!
+            # ==========================================================
+            if qualname and '<locals>' in qualname:
                 return tracer
 
-            caller_mod = caller_frame.f_globals.get("__name__", "")
-            callee_mod = frame.f_globals.get("__name__", "")
+            # ==========================================================
+            # 🛑 Iron Wall Block 2: Check the module's global namespace!
+            # Verify if it actually exists in the current module's global variables.
+            # This perfectly blocks hidden internal functions whose qualname was disguised by @wraps.
+            # ==========================================================
+            if qualname:
+                root_obj_name = qualname.split('.')[0]
+                if root_obj_name not in frame.f_globals:
+                    return tracer
+            else:
+                if func_name not in frame.f_globals:
+                    return tracer
 
-            # Boundary discovered! Caller is source_pkg, Callee is not source_pkg
-            if caller_mod.startswith(source_pkg) and not callee_mod.startswith(source_pkg):
-                func_name = frame.f_code.co_name
-                api_signature = f"{{callee_mod}}.{{func_name}}"
-                downstream_pkg = callee_mod.split('.')[0] if callee_mod else "builtins"
+            # 5. Construct perfect API signature
+            if qualname:
+                if is_instance_method and '.' in qualname:
+                    parts = qualname.rsplit('.', 1)
+                    api_signature = f"{raw_callee_mod}.{parts[0]}().{parts[1]}"
+                else:
+                    api_signature = f"{raw_callee_mod}.{qualname}"
+            else:
+                # Fallback degradation plan
+                class_name = cls_obj.__name__ if cls_obj else ""
+                if class_name:
+                    if func_name == '__init__':
+                        api_signature = f"{raw_callee_mod}.{class_name}"
+                    elif is_instance_method:
+                        api_signature = f"{raw_callee_mod}.{class_name}().{func_name}"
+                    else:
+                        api_signature = f"{raw_callee_mod}.{class_name}.{func_name}"
+                else:
+                    api_signature = f"{raw_callee_mod}.{func_name}"
 
-                # As long as not recorded, record print and pass
-                if api_signature not in recorded_apis:
-                    recorded_apis.add(api_signature)
+            # Logging logic
+            if api_signature not in recorded_apis:
+                recorded_apis.add(api_signature)
 
-                    try:
-                        arg_info = inspect.getargvalues(frame)
-                        args_dict = {{}}
-                        for arg_name in arg_info.args:
-                            args_dict[arg_name] = safe_repr(arg_info.locals.get(arg_name))
+                try:
+                    sig_trace = inspect.signature(func_obj_trace) if func_obj_trace else None
+                except Exception:
+                    sig_trace = None
 
-                        if arg_info.varargs:
-                            args_dict[arg_info.varargs] = safe_repr(arg_info.locals.get(arg_info.varargs))
-                        if arg_info.keywords:
-                            args_dict[arg_info.keywords] = safe_repr(arg_info.locals.get(arg_info.keywords))
-                    except Exception as e:
-                        args_dict = {{"error": f"Failed to extract args: {{str(e)}}"}}
+                arg_info = inspect.getargvalues(frame)
+                args_dict = {}
+                
+                for arg_name in arg_info.args:
+                    if arg_name in ('self', 'cls'):
+                        continue
+                        
+                    val = arg_info.locals.get(arg_name)
 
-                    call_record = {{
-                        "type": "call",
-                        "downstream_package": downstream_pkg,
-                        "downstream_api": api_signature,
-                        "called_by": f"{{caller_mod}}.{{caller_frame.f_code.co_name}}",
-                        "args": args_dict
-                    }}
-                    print(f"[BOUNDARY_CALL]{{json.dumps(call_record)}}")
+                    if sig_trace and arg_name in sig_trace.parameters:
+                        param = sig_trace.parameters[arg_name]
+                        if param.default is not inspect.Parameter.empty:
+                            try:
+                                if val == param.default:
+                                    continue
+                            except Exception:
+                                pass
+
+                    args_dict[arg_name] = safe_repr(val)
+
+                if arg_info.varargs:
+                    val = arg_info.locals.get(arg_info.varargs)
+                    args_dict[arg_info.varargs] = safe_repr(val)
+                    
+                if arg_info.keywords:
+                    val = arg_info.locals.get(arg_info.keywords)
+                    args_dict[arg_info.keywords] = safe_repr(val)
+
+                call_record = {
+                    "type": "call",
+                    "downstream_package": downstream_pkg,
+                    "downstream_api": api_signature,
+                    "called_by": f"{caller_mod}.{caller_frame.f_code.co_name}",
+                    "args": args_dict
+                }
+                # Streaming output to ensure capturing pre-crash state
+                print(f"[BOUNDARY_CALL]{json.dumps(call_record)}", flush=True)
 
         return tracer
 
     # --- Execution Controller ---
     def execute_with_trace(*run_args, **run_kwargs):
         nonlocal recorded_apis
-        recorded_apis.clear()  # Clear deduplication set before each retry to ensure new trace can be printed completely
+        recorded_apis.clear()
 
         original_trace = sys.gettrace()
         try:
@@ -1312,48 +1401,45 @@ def main():
             func_obj(*run_args, **run_kwargs)
             return True, "Execution completed normally"
         except Exception as e:
-            # Capture regular parameter or runtime errors
-            return False, f"{{type(e).__name__}}: {{str(e)}}"
+            return False, f"{type(e).__name__}: {str(e)}"
         finally:
             sys.settrace(original_trace)
 
     try:
-        func_obj = get_api_object(api_path)
+        func_obj = get_api_object(api_path, tracer)
     except Exception as e:
-        sys.stderr.write(f"Import error: {{str(e)}}\\n")
+        sys.stderr.write(f"Import error: {str(e)}\\n")
         sys.exit(3)
 
-    is_import_test = {api_call.get('is_import', False)}
-    
-    if is_import_test:
-        if func_obj is not None:
-            print("Import successful!")
-            sys.exit(0)
-        else:
-            sys.exit(1)
-
     if func_obj is None or not callable(func_obj):
-        sys.stderr.write(f"{{api_path}} is not callable or not found\\n")
+        sys.stderr.write(f"{api_path} is not callable or not found\\n")
         sys.exit(1)
 
-    # 1. Try original parameters
     success, msg = execute_with_trace(*args, **kwargs)
 
-    # 2. If original parameters trigger exception, automatically enter Mock fallback strategy
     if not success:
-        sys.stderr.write(f"Original args failed with: {{msg}}. Retrying with MagicMock...\\n")
+        sys.stderr.write(f"Original args failed with: {msg}. Retrying with MagicMock...\\n")
         mock_kwargs = generate_mock_kwargs(func_obj)
         success_mock, msg_mock = execute_with_trace(**mock_kwargs)
 
         if not success_mock:
-            sys.stderr.write(f"Mock args also failed with: {{msg_mock}}\\n")
+            sys.stderr.write(f"Mock args also failed with: {msg_mock}\\n")
 
     sys.exit(0)
 
 if __name__ == "__main__":
     main()
 '''
-        return script_content
+        # Chained replace for safe parameter injection
+        return script_content.replace(
+            "<<<CALLEE>>>", repr(callee)
+        ).replace(
+            "<<<PACKAGE>>>", repr(package)
+        ).replace(
+            "<<<ARGS_B64>>>", args_b64
+        ).replace(
+            "<<<KWARGS_B64>>>", kwargs_b64
+        )
 
     def _run_trace_script(self,
         script_content: str,
@@ -1540,8 +1626,13 @@ class ResultSaver:
 
                 for line in trace_list:
                     # Intercept both CALL and IMPORT
-                    if line.startswith('[BOUNDARY_CALL]') or line.startswith('[BOUNDARY_IMPORT]'):
-                        prefix = '[BOUNDARY_CALL]' if line.startswith('[BOUNDARY_CALL]') else '[BOUNDARY_IMPORT]'
+                    if line.startswith('[BOUNDARY_CALL]') or line.startswith('[BOUNDARY_IMPORT]') or line.startswith('[BOUNDARY_FROM_IMPORT]'):
+                        if line.startswith('[BOUNDARY_CALL]'):
+                            prefix = '[BOUNDARY_CALL]'
+                        elif line.startswith('[BOUNDARY_FROM_IMPORT]'):
+                            prefix = '[BOUNDARY_FROM_IMPORT]'
+                        else:
+                            prefix = '[BOUNDARY_IMPORT]'
                         json_str = line.replace(prefix, '').strip()
 
                         try:
@@ -1550,11 +1641,6 @@ class ResultSaver:
                             continue
 
                         downstream_pkg = call_record.get('downstream_package', 'unknown')
-
-                        if downstream_pkg in sys.stdlib_module_names:
-                            # Ignore standard library calls or imports
-                            continue
-
                         record_type = call_record.get('type', 'call')
                         called_by = call_record.get('called_by', 'unknown')
 
@@ -1564,6 +1650,12 @@ class ResultSaver:
                             # Generate deduplication unique key: API name + cleaned parameter structure
                             norm_args_str = normalize_args(args_dict)
                             unique_key = f"call::{downstream_api}::{norm_args_str}"
+                        elif prefix == '[BOUNDARY_FROM_IMPORT]':
+                            downstream_api = call_record.get('downstream_module', 'unknown')
+                            imported_names = call_record.get('imported_names', [])
+                            args_dict = {"imported_names": imported_names}
+                            names_str = ",".join(sorted(imported_names))
+                            unique_key = f"from_import::{downstream_api}::{names_str}"
                         else:
                             # For import type, target is specific module
                             downstream_api = call_record.get('downstream_module', 'unknown')
@@ -1596,8 +1688,7 @@ class ResultSaver:
             file_path = os.path.join(api_log_dir, f"{pkg}_apis.py")
             with open(file_path, 'w', encoding='utf-8') as f:
                 f.write(f"# API Calls for {pkg}\n")
-                f.write(f"# Auto-extracted boundary calls originating from {package_name}\n")
-                f.write(f"import importlib\n\n")  # New: ensure downstream script can run dynamic imports smoothly
+                f.write(f"# Auto-extracted boundary calls originating from {package_name}\n\n")
 
                 # Sort by API ID in ascending order to ensure file looks neat
                 sorted_apis = sorted(apis.values(), key=lambda x: x["api_id"])
@@ -1617,6 +1708,19 @@ class ResultSaver:
                         args_str = ", ".join(args_parts)
                         # Generate code form similar to keras.layers.Input(...)
                         executable_code = f"{api_name}({args_str})"
+                    elif api_type == "from_import":
+                        imported_names = api_info.get("args_dict", {}).get("imported_names", [])
+                        
+                        check_lines = [
+                            f"mod = importlib.import_module('{api_name}')"
+                        ]
+                        
+                        for name in imported_names:
+                            check_lines.append(
+                                f"if not hasattr(mod, '{name}'): raise ImportError(\"cannot import name '{name}' from '{api_name}'\")"
+                            )
+
+                        executable_code = "\n".join(check_lines)
                     elif api_type == "import":
                         # For import behavior, use dynamic import to verify compatibility (success if no ModuleNotFoundError)
                         executable_code = f"importlib.import_module('{api_name}')"
@@ -1661,7 +1765,7 @@ class ResultSaver:
 class CompatibilityTester:
     """Main controller: coordinate overall test workflow"""
 
-    def __init__(self, num_workers: int = None):
+    def __init__(self, num_workers: int = None, versions: List[str] = None):
         # Load PyPI import mapping
         script_dir = Path(__file__).parent
         self.pypi_import_mapping = self._load_pypi_import_mapping(
@@ -1674,6 +1778,9 @@ class CompatibilityTester:
 
         # Determine worker count
         self.num_workers = num_workers
+
+        # Store optional versions parameter
+        self.versions = versions
 
     def run(
         self,
@@ -1704,8 +1811,11 @@ class CompatibilityTester:
 
         # Step 2: Get all versions
         print(f"Step 2: Fetching available versions from PyPI...")
-        # versions = self.version_fetcher.fetch_all_versions(package_name)
-        versions = ['2.53.0']  # For debugging, use above line in production
+        if self.versions:
+            versions = self.versions
+            print(f"  ✓ Using provided versions: {versions}")
+        else:
+            versions = self.version_fetcher.fetch_all_versions(package_name)
 
         if not versions:
             print(f"  ✗ No versions found for package '{package_name}'")
@@ -1893,6 +2003,12 @@ def main():
         default=10,
         help='Number of worker processes (default: 10)'
     )
+    parser.add_argument(
+        '--versions',
+        nargs='+',
+        type=str,
+        help='List of specific versions to test (optional, overrides PyPI fetching)'
+    )
 
     args = parser.parse_args()
 
@@ -1908,7 +2024,7 @@ def main():
 
     # Create tester and run
     try:
-        tester = CompatibilityTester(num_workers=args.workers)
+        tester = CompatibilityTester(num_workers=args.workers, versions=args.versions)
         tester.run(
             apis_file_path=apis_file_path,
             output_file=args.output,

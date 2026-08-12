@@ -38,6 +38,7 @@ import importlib
 import importlib.util
 import subprocess
 import json
+import time
 from pathlib import Path
 from typing import Dict, List, Set, Optional, Tuple
 from collections import defaultdict
@@ -60,8 +61,155 @@ class LibraryCallExtractor:
         # Structure: {library_name: {api_call: [(args, kwargs), ...]}}
         self.library_calls = defaultdict(lambda: defaultdict(list))
 
+        # Store import records by library
+        # Structure: {library_name: [import_record1, import_record2, ...]}
+        self.library_imports = defaultdict(list)
+
         # Load PyPI import mapping from JSON file
         self.module_to_package = self._load_pypi_import_mapping()
+
+    def _setup_venv(self, work_dir: str, venv_name: str = '.venv') -> Tuple[bool, str]:
+        """
+        Create isolated virtual environment
+
+        Args:
+            work_dir: Working directory
+            venv_name: Name of venv directory
+
+        Returns:
+            (Success flag, Error message)
+        """
+        try:
+            venv_path = os.path.join(work_dir, venv_name)
+            # Create isolated environment variables
+            venv_creation_env = {
+                'PATH': os.environ.get('PATH', ''),
+                'HOME': os.environ.get('HOME', ''),
+                'USER': os.environ.get('USER', ''),
+                'LOGNAME': os.environ.get('LOGNAME', ''),
+                'PYTHONHOME': '',
+                'PYTHONPATH': '',
+                'PYTHONUSERBASE': '',
+                'PYTHONSTARTUP': '',
+                'PYTHONOPTIMIZE': '',
+                'PYTHONDONTWRITEBYTECODE': '1',
+                'PYTHONNOUSERSITE': '1',
+                'LANG': os.environ.get('LANG', 'C.UTF-8'),
+                'LC_ALL': os.environ.get('LC_ALL', 'C.UTF-8'),
+            }
+
+            # Create new venv
+            result = subprocess.run(
+                ['python3', '-m', 'venv', '--clear', venv_path],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                env=venv_creation_env
+            )
+
+            if result.returncode != 0:
+                return False, f"Failed to create venv: {result.stderr}"
+
+            # Verify venv was created successfully
+            pip_path = os.path.join(venv_path, 'bin', 'pip')
+            if not os.path.exists(pip_path):
+                return False, f"Venv created but pip not found at {pip_path}"
+
+            return True, ""
+        except subprocess.TimeoutExpired:
+            return False, "Timeout while creating venv"
+        except Exception as e:
+            return False, f"Error creating venv: {str(e)}"
+
+    def _install_package(self, package_name: str, venv_path: str, version: Optional[str] = None) -> Tuple[bool, str]:
+        """
+        Install a package in venv
+
+        Args:
+            package_name: Import name of package
+            venv_path: Path to venv
+            version: Version number (optional)
+
+        Returns:
+            (Success flag, Error message)
+        """
+        # Convert import_name to PyPI package name if mapping exists
+        if package_name in self.module_to_package:
+            pypi_pkg_name = self.module_to_package[package_name]
+            print(f"  [Mapping] Using PyPI package name '{pypi_pkg_name}' for import name '{package_name}'")
+        else:
+            pypi_pkg_name = package_name
+
+        pip_path = os.path.join(venv_path, 'bin', 'pip')
+
+        if version:
+            package_spec = f"{pypi_pkg_name}=={version}"
+        else:
+            package_spec = pypi_pkg_name
+
+        pip_install_env = {
+            'PATH': f"{os.path.join(venv_path, 'bin')}:{os.environ.get('PATH', '')}",
+            'HOME': os.environ.get('HOME', ''),
+            'VIRTUAL_ENV': venv_path,
+            'PYTHONHOME': '',
+            'PYTHONPATH': '',
+            'PYTHONUSERBASE': '',
+            'PYTHONDONTWRITEBYTECODE': '1',
+            'PYTHONNOUSERSITE': '1',
+            'PIP_CONFIG_FILE': '/dev/null',
+            'PIP_REQUIRE_VIRTUALENV': '1',
+            'PIP_NO_INPUT': '1',
+            'PIP_DISABLE_PIP_VERSION_CHECK': '1',
+            'PIP_QUIET': '1',
+            'LANG': os.environ.get('LANG', 'C.UTF-8'),
+            'LC_ALL': os.environ.get('LC_ALL', 'C.UTF-8'),
+        }
+
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                result = subprocess.run(
+                    [pip_path, 'install', package_spec],
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                    env=pip_install_env,
+                )
+
+                if result.returncode != 0:
+                    stderr_lower = result.stderr.lower()
+
+                    permanent_errors = [
+                        "resolutionimpossible",
+                        "conflict",
+                        "no matching distribution",
+                        "could not find a version"
+                    ]
+
+                    if any(error in stderr_lower for error in permanent_errors):
+                        return False, f"Package conflict or not found for {package_spec}:\n{result.stderr}"
+
+                    if attempt == max_retries:
+                        return False, f"Failed to install {package_spec} after {max_retries} attempts:\n{result.stderr}"
+
+                    time.sleep(3)
+                    continue
+
+                return True, ""
+
+            except subprocess.TimeoutExpired:
+                if attempt == max_retries:
+                    return False, f"Timeout while installing {package_spec} after {max_retries} attempts"
+                time.sleep(3)
+                continue
+
+            except Exception as e:
+                if attempt == max_retries:
+                    return False, f"Error installing package after {max_retries} attempts: {str(e)}"
+                time.sleep(3)
+                continue
+
+        return False, "Installation failed"
 
     def _load_pypi_import_mapping(self) -> Dict[str, str]:
         """
@@ -154,10 +302,19 @@ class LibraryCallExtractor:
                 content = f.read()
 
             python_blocks = []
-            heredoc_pattern = r"cat\s+>\s+(\S+\.py)\s+<<\s*'?(\w+)'?\s*\n(.*?)\n\2"
-            for match in re.finditer(heredoc_pattern, content, re.DOTALL):
+        
+            # Pattern 1: cat > file.py << EOF
+            pattern1 = r"cat\s+>\s+(\S+\.py)\s+<<\s*'?(\w+)'?\s*\n(.*?)\n\2"
+            for match in re.finditer(pattern1, content, re.DOTALL):
                 filename, delimiter, code = match.groups()
                 python_blocks.append((filename, code))
+            
+            # Pattern 2: python3 << EOF (direct execution)
+            pattern2 = r"python3\s+<<\s*'?(\w+)'?\s*\n(.*?)\n\1"
+            for match in re.finditer(pattern2, content, re.DOTALL):
+                delimiter, code = match.groups()
+                python_blocks.append(("inline_python", code))
+                
             return python_blocks
         else:
             with open(script_path, 'r') as f:
@@ -171,14 +328,37 @@ class LibraryCallExtractor:
             print(f"Warning: Syntax error in {filename}: {e}")
             return None
 
-    def _extract_imports(self, tree: ast.AST) -> Dict[str, str]:
-        """Extract import statements and build import mapping"""
+    def _extract_imports(self, tree: ast.AST, filename: str) -> Tuple[Dict[str, str], List[Dict]]:
+        """
+        Extract import statements and build import mapping.
+
+        Returns:
+            Tuple of (imports_dict, import_records)
+            - imports_dict: mapping for resolving names in code
+            - import_records: list of import records for API log generation
+        """
         imports = {}
+        import_records = []
+        script_dir = self.script_path.parent if self.script_path.is_file() else self.script_path
+
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     name = alias.asname if alias.asname else alias.name
                     imports[name] = alias.name
+
+                    # Record the import if it's a target package
+                    mod_name = alias.name
+                    if mod_name and not self._is_local_import(mod_name, script_dir):
+                        top_level_pkg = mod_name.split('.')[0]
+                        import_records.append({
+                            "type": "import",
+                            "downstream_module": mod_name,
+                            "downstream_package": top_level_pkg,
+                            "file": filename,
+                            "lineno": node.lineno
+                        })
+
             elif isinstance(node, ast.ImportFrom):
                 module = node.module or ''
                 for alias in node.names:
@@ -187,7 +367,21 @@ class LibraryCallExtractor:
                     else:
                         name = alias.asname if alias.asname else alias.name
                         imports[name] = f"{module}.{alias.name}" if module else alias.name
-        return imports
+
+                # Record the from import if it's from an external library
+                if module and not self._is_local_import(module, script_dir):
+                    names = [alias.name for alias in node.names]
+                    top_level_pkg = module.split('.')[0]
+                    import_records.append({
+                        "type": "from_import",
+                        "downstream_module": module,
+                        "downstream_package": top_level_pkg,
+                        "imported_names": names,
+                        "file": filename,
+                        "lineno": node.lineno
+                    })
+
+        return imports, import_records
 
     def _collect_all_imports(self, python_blocks: List[Tuple[str, str]]) -> Set[str]:
         """Collect all unique package names from imports across all Python blocks"""
@@ -365,13 +559,14 @@ class LibraryCallExtractor:
 
         # Extract top-level package (preserve original case)
         top_level = module_name.split('.')[0]
+        return top_level
 
-        if self._is_target_package(module_name):
-            # Return the matching package name from target_packages with original case
-            for target_pkg in self.target_packages:
-                if target_pkg.lower() == top_level.lower():
-                    return target_pkg
-        return None
+        # if self._is_target_package(module_name):
+        #     # Return the matching package name from target_packages with original case
+        #     for target_pkg in self.target_packages:
+        #         if target_pkg.lower() == top_level.lower():
+        #             return target_pkg
+        # return None
 
     def _extract_function_calls(self, tree: ast.AST, imports: Dict[str, str],
                               source_file: str) -> List[Tuple[str, str, int, List, Dict]]:
@@ -451,57 +646,449 @@ class LibraryCallExtractor:
         else:
             return repr(value)
 
+    def _generate_trace_script(self, script: str) -> str:
+        """
+        Generate Python script that traces API calls during execution
+
+        Args:
+            script: Python code to trace
+
+        Returns:
+            Complete tracing script content
+        """
+        import base64
+
+        # Encode the script to avoid any quote/escape issues
+        encoded_script = base64.b64encode(script.encode('utf-8')).decode('ascii')
+
+        trace_script = '''#!/usr/bin/env python3
+import sys
+import os
+import json
+import base64
+import inspect
+from collections import defaultdict
+
+user_file_paths = set()
+
+# Store traced API calls by package
+traced_calls = defaultdict(list)
+
+def tracer(frame, event, arg):
+    if event != 'call':
+        return tracer
+
+    func_name = frame.f_code.co_name
+    
+    # Filter out module initialization noise
+    if func_name == '<module>':
+        return tracer
+
+    callee_mod = frame.f_globals.get("__name__", "")
+    if not callee_mod or callee_mod.startswith("namedtuple_"):
+        return tracer
+
+    # 1. Dynamically get which package the currently executing API belongs to
+    current_pkg = callee_mod.split('.')[0]
+
+    if current_pkg in sys.stdlib_module_names:
+        return tracer
+
+    caller_frame = frame.f_back
+    caller_file = None
+    caller_line = None
+    caller_mod = "__main__"
+
+    if caller_frame:
+        caller_mod = caller_frame.f_globals.get("__name__", caller_mod)        
+        caller_file = caller_frame.f_code.co_filename
+        caller_line = caller_frame.f_lineno
+
+    if not caller_file:
+        return tracer
+
+    # Absolute path whitelist check (fixed self.tracer error)
+    if os.path.abspath(caller_file) not in user_file_paths:
+        return tracer
+
+    # ==============================================================
+    # 3. Extract real API name and record (using ultimate weapon __qualname__)
+    # ==============================================================
+    is_instance_method = False
+    cls_obj = None
+
+    if 'self' in frame.f_locals:
+        cls_obj = frame.f_locals['self'].__class__
+        is_instance_method = True
+    elif 'cls' in frame.f_locals:
+        cls_obj = frame.f_locals['cls']
+        if not isinstance(cls_obj, type):
+            cls_obj = None
+
+    # Core: Get the real function object through reflection and extract __qualname__ with lineage info
+    qualname = None
+    if cls_obj:
+        func_obj = getattr(cls_obj, func_name, None)
+    else:
+        func_obj = frame.f_globals.get(func_name)
+
+    if func_obj:
+        qualname = getattr(func_obj, '__qualname__', None)
+
+    # ==========================================================
+    # 🛑 Iron Wall Interception 1: Never let any closure slip through!
+    # If it's an internal closure function, discard it immediately - don't let it enter the fallback logic!
+    # ==========================================================
+    if qualname and '<locals>' in qualname:
+        return tracer
+
+    # ==========================================================
+    # 🛑 Iron Wall Interception 2: Check the module's global namespace registry!
+    # Verify if it really exists in the current module's global variables.
+    # This perfectly intercepts hidden internal functions whose qualname was disguised by @wraps.
+    # ==========================================================
+    if qualname:
+        root_obj_name = qualname.split('.')[0]
+        if root_obj_name not in frame.f_globals:
+            return tracer
+    else:
+        if func_name not in frame.f_globals:
+            return tracer
+
+    # Construct API signature
+    if qualname:
+        # If it's a method inside a class, qualname will contain '.' (e.g., 'ChatOpenAI.get_num_tokens_from_messages' or 'BaseModel.__init__')
+        if is_instance_method and '.' in qualname:
+            # Compatible with anonymous instantiation check script: add () before the last dot
+            parts = qualname.rsplit('.', 1)
+            api_path = f"{callee_mod}.{parts[0]}().{parts[1]}"
+        else:
+            api_path = f"{callee_mod}.{qualname}"
+    else:
+        # Fallback: If qualname is not available (rare C extensions or special cases), fall back to regular concatenation
+        class_name = cls_obj.__name__ if cls_obj else ""
+        if class_name:
+            if func_name == '__init__':
+                api_path = f"{callee_mod}.{class_name}"
+            elif is_instance_method:
+                api_path = f"{callee_mod}.{class_name}().{func_name}"
+            else:
+                api_path = f"{callee_mod}.{class_name}.{func_name}"
+        else:
+            api_path = f"{callee_mod}.{func_name}"
+
+    # ==============================================================
+    # 4. Extract arguments (Smart Default Filtering)
+    # ==============================================================
+    try:
+        # === 4.1 Dynamically get the real function object and extract official signature ===
+        # func_name was already obtained via frame.f_code.co_name in previous code
+        func_obj = None
+        if 'self' in frame.f_locals:
+            func_obj = getattr(frame.f_locals['self'].__class__, func_name, None)
+        elif 'cls' in frame.f_locals:
+            cls_obj = frame.f_locals['cls']
+            if isinstance(cls_obj, type):
+                func_obj = getattr(cls_obj, func_name, None)
+        else:
+            func_obj = frame.f_globals.get(func_name)
+
+        sig = None
+        if func_obj:
+            try:
+                sig = inspect.signature(func_obj)
+            except Exception:
+                pass
+        # ================================================
+
+        arg_info = inspect.getargvalues(frame)
+        args_dict = {}
+
+        for arg_name in arg_info.args:
+            if arg_name in ('self', 'cls'):
+                continue
+
+            val = arg_info.locals.get(arg_name)
+
+            # === 4.2 Core magic: Smart default parameter filtering ===
+            if sig and arg_name in sig.parameters:
+                param = sig.parameters[arg_name]
+                # Check if this parameter has a default value
+                if param.default is not inspect.Parameter.empty:
+                    try:
+                        # If current runtime value equals default value, it's likely not explicitly passed by user - discard it!
+                        if val == param.default:
+                            continue
+                    except Exception:
+                        # Prevent exceptions from special objects that overrode __eq__ (like Numpy) during comparison
+                        pass
+            # ======================================
+
+            try:
+                args_dict[arg_name] = repr(val)
+            except:
+                args_dict[arg_name] = "<unrepresentable>"
+
+        if arg_info.varargs:
+            val = arg_info.locals.get(arg_info.varargs)
+            try:
+                args_dict[arg_info.varargs] = repr(val)
+            except:
+                args_dict[arg_info.varargs] = "<unrepresentable>"
+
+        if arg_info.keywords:
+            val = arg_info.locals.get(arg_info.keywords)
+            try:
+                args_dict[arg_info.keywords] = repr(val)
+            except:
+                args_dict[arg_info.keywords] = "<unrepresentable>"
+                
+    except Exception as e:
+        args_dict = {"error": f"Failed to extract args: {str(e)}"}
+
+    call_record = {
+        "api": api_path,
+        "caller": f"{caller_mod}.user_code", 
+        "caller_file": caller_file,
+        "args": args_dict,
+        "line": caller_line
+    }
+
+    # Store the traced call in the global traced_calls dictionary
+    traced_calls[current_pkg].append(call_record)
+
+    # Return the tracer function for continued tracing
+    return tracer
+
+# User code to execute
+def main():
+    try:
+        user_script_path = os.path.abspath("user_script.py")
+        global user_file_paths
+        user_file_paths.add(user_script_path)
+
+        # Decode the base64-encoded script
+        encoded_script = "<<<ENCODED_SCRIPT>>>"
+        user_code = base64.b64decode(encoded_script).decode('utf-8')
+
+        sys.settrace(tracer)
+        exec(compile(user_code, user_script_path, 'exec'))
+    except ModuleNotFoundError as e:
+        # Format error output to stderr for outer layer regex to capture precisely
+        sys.stderr.write(f"ModuleNotFoundError: No module named '{e.name}'\\n")
+        sys.exit(2)
+    except Exception as e:
+        # Allow the script to continue even if execution fails
+        sys.stderr.write(f"Warning: Script execution error: {str(e)}\\n")
+    finally:
+        sys.settrace(None)
+        # Output traced calls as JSON
+        for pkg, calls in traced_calls.items():
+            if calls:
+                for call in calls:
+                    print(f"[TRACE]{json.dumps(call)}")
+
+if __name__ == "__main__":
+    main()
+'''
+        return trace_script.replace("<<<ENCODED_SCRIPT>>>", encoded_script)
+
+    def _run_trace_script(self, script_content: str, venv_path: str) -> Tuple[bool, str, str]:
+        """
+        Run the trace script in the specified venv
+
+        Args:
+            script_content: Complete script to execute
+            venv_path: Path to virtual environment
+
+        Returns:
+            (success, stdout, stderr)
+        """
+        python_path = os.path.join(venv_path, 'bin', 'python')
+
+        # Write script to temporary file
+        script_file = os.path.join(os.path.dirname(venv_path), 'trace_script.py')
+
+        try:
+            with open(script_file, 'w') as f:
+                f.write(script_content)
+            os.chmod(script_file, 0o755)
+
+            # Run script
+            result = subprocess.run(
+                [python_path, script_file],
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
+
+            success = result.returncode == 0
+            return success, result.stdout, result.stderr
+
+        except subprocess.TimeoutExpired as e:
+            return False, "", "Timeout during script execution"
+        except Exception as e:
+            return False, "", f"Error running trace script: {str(e)}"
+        finally:
+            # Clean up script file
+            if os.path.exists(script_file):
+                os.remove(script_file)
+
+    def _parse_trace_output(self, stdout: str, filename: str):
+        """
+        Parse the trace output and populate library_calls and library_imports
+
+        Args:
+            stdout: Output from trace script
+            filename: Name of the source file
+        """
+        for line in stdout.split('\n'):
+            if not line.startswith('[TRACE]'):
+                continue
+
+            json_str = line.replace('[TRACE]', '').strip()
+            try:
+                call_record = json.loads(json_str)
+            except json.JSONDecodeError:
+                continue
+
+            api_path = call_record.get('api', '')
+            args_dict = call_record.get('args', {})
+            caller = call_record.get('caller', 'unknown')
+            lineno = call_record.get('line', 0)
+
+            # Determine which package this belongs to
+            package = self._get_package_from_module(api_path)
+            if not package:
+                continue
+
+            # Store the call with its arguments
+            # Convert args_dict back to args/kwargs format
+            args = []
+            kwargs = {}
+            for key, val in args_dict.items():
+                if key not in ['self', 'cls']:
+                    kwargs[key] = {'type': 'expression', 'value': val}
+
+            self.library_calls[package][api_path].append({
+                'args': args,
+                'kwargs': kwargs,
+                'line': lineno,
+                'file': filename
+            })
+
     def extract_calls(self):
-        """Main extraction function"""
+        """Main extraction function using dynamic tracing"""
         print(f"\n{'='*60}")
         print(f"Extracting Library Calls from: {self.script_path}")
         print(f"{'='*60}\n")
 
-        # Extract and analyze user code
+        # Extract Python code from script
         python_blocks = self._extract_script_content(self.script_path)
 
-        # Step 1: Collect all imports and determine target packages
-        print("Step 1: Collecting all imports from code...")
-        all_imports = self._collect_all_imports(python_blocks)
-        print(f"Found {len(all_imports)} unique imported packages")
+        # Step 1: Collect all imports from code (AST-based)
+        # print("Step 1: Collecting all imports from code...")
+        # all_imports = self._collect_all_imports(python_blocks)
+        # print(f"Found {len(all_imports)} unique imported packages")
 
         # Step 2: Filter to only installable packages
-        print("\nStep 2: Filtering installable packages...")
-        self.target_packages = self._filter_installable_packages(all_imports)
-        print(f"\nTarget packages ({len(self.target_packages)}): {sorted(self.target_packages)}")
+        # print("\nStep 2: Filtering installable packages...")
+        # self.target_packages = self._filter_installable_packages(all_imports)
+        # print(f"\nTarget packages ({len(self.target_packages)}): {sorted(self.target_packages)}")
 
-        if not self.target_packages:
-            print("\nNo installable third-party packages found!")
-            return
+        # if not self.target_packages:
+        #     print("\nNo installable third-party packages found!")
+        #     return
 
-        # Step 3: Extract API calls for target packages
-        print(f"\nStep 3: Extracting API calls for target packages...")
-        for filename, code in python_blocks:
-            print(f"Analyzing: {filename}")
+        # Step 3: Extract import records using AST
+        # print(f"\nStep 3: Extracting import records using AST...")
+        # for filename, code in python_blocks:
+        #     tree = self._parse_ast(code, filename)
+        #     if not tree:
+        #         continue
 
-            tree = self._parse_ast(code, filename)
-            if not tree:
-                continue
+        #     imports, import_records = self._extract_imports(tree, filename)
 
-            imports = self._extract_imports(tree)
-            calls = self._extract_function_calls(tree, imports, filename)
+        #     # Process import records
+        #     for import_record in import_records:
+        #         package = import_record['downstream_package']
+        #         # Only keep imports for target packages
+        #         if package in self.target_packages:
+        #             self.library_imports[package].append(import_record)
 
-            # Categorize calls by library (only target packages)
-            for source_file, callee, lineno, args, kwargs in calls:
-                package = self._get_package_from_module(callee)
-                if package:
-                    # Store the call with its arguments
-                    call_signature = (
-                        callee,
-                        tuple((self._format_arg_for_code(arg) for arg in args)),
-                        tuple(sorted((k, self._format_arg_for_code(v)) for k, v in kwargs.items()))
+        # Step 4: Create venv and extract API calls via dynamic tracing
+        # Note: Dynamic tracing uses caller-based filtering (is_user_code)
+        # instead of TARGET_PACKAGES
+        # print(f"\nStep 4: Extracting API calls via dynamic tracing...")
+
+        # Create a temporary venv for tracing
+        import tempfile
+        import shutil
+        work_dir = tempfile.mkdtemp(prefix="extract_api_calls_")
+        venv_path = os.path.join(work_dir, '.venv')
+
+        try:
+            # Create venv
+            print("  Creating virtual environment...")
+            success, error = self._setup_venv(work_dir, '.venv')
+            if not success:
+                print(f"  ✗ Failed to create venv: {error}")
+                return
+            print("  ✓ Virtual environment created")
+
+            # Process each Python block
+            for filename, code in python_blocks:
+                print(f"\n  Tracing: {filename}")
+
+                # Execute with retries for missing packages
+                max_retries = 10
+                attempt = 0
+
+                while attempt < max_retries:
+                    # Generate trace script
+                    script_content = self._generate_trace_script(code)
+
+                    # Run script
+                    success, stdout, stderr = self._run_trace_script(
+                        script_content=script_content,
+                        venv_path=venv_path
                     )
-                    self.library_calls[package][callee].append({
-                        'args': args,
-                        'kwargs': kwargs,
-                        'line': lineno,
-                        'file': source_file
-                    })
+
+                    if success:
+                        # Parse trace output
+                        self._parse_trace_output(stdout, filename)
+                        print(f"  ✓ Successfully traced {filename}")
+                        break
+
+                    # Check for missing packages
+                    missing_match = re.search(r"ModuleNotFoundError: No module named '([^']+)'", stderr)
+
+                    if missing_match:
+                        missing_pkg = missing_match.group(1)
+                        print(f"  [Attempt {attempt+1}/{max_retries}] Missing package: '{missing_pkg}', installing...")
+
+                        install_success, error_msg = self._install_package(
+                            package_name=missing_pkg,
+                            venv_path=venv_path,
+                        )
+
+                        if install_success:
+                            print(f"  ✓ Installed {missing_pkg}, retrying...")
+                            attempt += 1
+                            continue
+                        else:
+                            print(f"  ✗ Failed to install {missing_pkg}: {error_msg}")
+                            break
+                    else:
+                        print(f"  ✗ Trace failed: {stderr[:2000]}")
+                        break
+
+                if attempt >= max_retries:
+                    print(f"  ✗ Max retries reached for {filename}")
+
+        finally:
+            # Clean up temporary directory
+            shutil.rmtree(work_dir, ignore_errors=True)
 
         # Print summary
         total_calls = sum(len(calls) for lib_calls in self.library_calls.values()
@@ -509,28 +1096,34 @@ class LibraryCallExtractor:
         print(f"\nExtracted {total_calls} library calls from {len(self.library_calls)} libraries")
 
     def save_api_logs(self):
-        """Save API calls for each library to separate Python scripts with deduplication"""
+        """Save API calls and imports for each library to separate Python scripts with deduplication"""
         print(f"\n{'='*60}")
         print("Saving API Logs")
         print(f"{'='*60}\n")
 
-        for library, api_calls in self.library_calls.items():
+        # Merge all libraries from both calls and imports
+        all_libraries = set(self.library_calls.keys()) | set(self.library_imports.keys())
+
+        for library in all_libraries:
             # Create a set to track unique API calls
             unique_apis = set()
             api_call_records = []
 
+            # Process API function calls
+            api_calls = self.library_calls.get(library, {})
             for api_name, call_list in sorted(api_calls.items()):
                 for call_info in call_list:
                     # Create a unique signature for deduplication
                     args_tuple = tuple(self._format_arg_for_code(arg) for arg in call_info['args'])
                     kwargs_tuple = tuple(sorted((k, self._format_arg_for_code(v))
                                                for k, v in call_info['kwargs'].items()))
-                    signature = (api_name, args_tuple, kwargs_tuple)
+                    signature = ('call', api_name, args_tuple, kwargs_tuple)
 
                     # Only add if not already seen
                     if signature not in unique_apis:
                         unique_apis.add(signature)
                         api_call_records.append({
+                            'type': 'call',
                             'api': api_name,
                             'args': call_info['args'],
                             'kwargs': call_info['kwargs'],
@@ -538,14 +1131,41 @@ class LibraryCallExtractor:
                             'line': call_info['line']
                         })
 
+            # Process import records
+            seen_imports = set()
+            import_records = self.library_imports.get(library, [])
+            for import_record in import_records:
+                import_type = import_record['type']
+                downstream_module = import_record['downstream_module']
+
+                if import_type == 'from_import':
+                    # For from_import, include imported_names in signature
+                    imported_names = tuple(sorted(import_record['imported_names']))
+                    signature = ('from_import', downstream_module, imported_names)
+                else:
+                    # For import, just use module name
+                    signature = ('import', downstream_module)
+
+                # Only add if not already seen
+                if signature not in seen_imports:
+                    seen_imports.add(signature)
+                    api_call_records.append({
+                        'type': import_type,
+                        'api': downstream_module,
+                        'imported_names': import_record.get('imported_names', []),
+                        'source_file': import_record['file'],
+                        'line': import_record['lineno']
+                    })
+
             # Generate Python script for this library
             output_file = self.api_log_dir / f"{library}_apis.py"
+            total_unique = len(unique_apis) + len(seen_imports)
             self._write_api_log_script(output_file, library, api_call_records)
-            print(f"Generated: {output_file} ({len(unique_apis)} unique API calls)")
+            print(f"Generated: {output_file} ({total_unique} unique API calls/imports)")
 
     def _write_api_log_script(self, output_file: Path, library: str,
                              api_call_records: List[Dict]):
-        """Write API calls to a Python script file"""
+        """Write API calls and imports to a Python script file"""
         with open(output_file, 'w') as f:
             # Write header comments
             f.write(f'# API calls in library: None\n')
@@ -554,30 +1174,48 @@ class LibraryCallExtractor:
             f.write(f'# Total unique API calls: {len(api_call_records)}\n')
             f.write(f'\n')
 
-            # Write each API call with its metadata
+            # Write each API call or import with its metadata
             for api_id, record in enumerate(api_call_records, 1):
+                record_type = record.get('type', 'call')
                 api_name = record['api']
-
-                # Format arguments
-                args_str_list = []
-                for arg in record['args']:
-                    args_str_list.append(self._format_arg_for_code(arg))
-
-                kwargs_str_list = []
-                for k, v in record['kwargs'].items():
-                    kwargs_str_list.append(f"{k}={self._format_arg_for_code(v)}")
-
-                all_args = ', '.join(args_str_list + kwargs_str_list)
 
                 # Write API metadata in the required format
                 f.write(f'# API ID: {api_id}\n')
                 f.write(f'# Found in versions: None\n')
-                f.write(f'# Type: call\n')
-                f.write(f'# API: {api_name}\n')
+                f.write(f'# Type: {record_type}\n')
+                f.write(f'# Target: {api_name}\n')
                 f.write(f'# Call chain: None\n')
 
-                # Write the actual API call
-                f.write(f'{api_name}({all_args})\n')
+                # Generate different code based on type
+                if record_type == 'call':
+                    # Format arguments
+                    args_str_list = []
+                    for arg in record['args']:
+                        args_str_list.append(self._format_arg_for_code(arg))
+
+                    kwargs_str_list = []
+                    for k, v in record['kwargs'].items():
+                        kwargs_str_list.append(f"{k}={self._format_arg_for_code(v)}")
+
+                    all_args = ', '.join(args_str_list + kwargs_str_list)
+
+                    # Write the actual API call
+                    f.write(f'{api_name}({all_args})\n')
+
+                elif record_type == 'from_import':
+                    # For from_import, generate importlib code to check each imported name
+                    imported_names = record.get('imported_names', [])
+                    f.write(f"mod = importlib.import_module('{api_name}')\n")
+                    for name in imported_names:
+                        f.write(f"if not hasattr(mod, '{name}'): raise ImportError(\"cannot import name '{name}' from '{api_name}'\")\n")
+
+                elif record_type == 'import':
+                    # For import, use dynamic import to verify compatibility
+                    f.write(f"importlib.import_module('{api_name}')\n")
+
+                else:
+                    f.write(f"# Unknown API type: {record_type}\n")
+
                 f.write(f'\n')
 
 
