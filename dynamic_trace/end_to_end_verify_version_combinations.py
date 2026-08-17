@@ -51,6 +51,11 @@ def load_pypi_import_mapping(mapping_file="pypi_import_mapping.json"):
         print(f"⚠️ Failed to load mapping file {mapping_file}: {e}")
         return {}
 
+# Convert package name to PyPI name
+def get_pypi_name(pkg_name: str) -> str:
+    if pkg_name in PYPI_IMPORT_MAPPING:
+        return PYPI_IMPORT_MAPPING[pkg_name]
+    return pkg_name
 
 # Load PyPI import mapping at module level
 SCRIPT_DIR = Path(__file__).parent
@@ -214,11 +219,6 @@ def fetch_all_versions(package_name: str) -> List[str]:
         - Input package_name is import_name, will be converted to pypi_name via mapping
         - Versions are sorted according to semantic versioning rules (using packaging.version.parse)
     """
-    # Convert package name to PyPI name
-    def get_pypi_name(pkg_name: str) -> str:
-        if pkg_name in PYPI_IMPORT_MAPPING:
-            return PYPI_IMPORT_MAPPING[pkg_name]
-        return pkg_name
 
     try:
         # Get PyPI package name via mapping (if exists)
@@ -261,12 +261,6 @@ def fetch_package_versions_by_call_chain(package_name: str, call_chain: List[str
         (Version list in descending order, whether this is a new package)
     """
     versions_set = set()
-
-    # Convert package name to PyPI name
-    def get_pypi_name(pkg_name: str) -> str:
-        if pkg_name in PYPI_IMPORT_MAPPING:
-            return PYPI_IMPORT_MAPPING[pkg_name]
-        return pkg_name
 
     target_pypi_name = get_pypi_name(package_name)
 
@@ -360,8 +354,9 @@ def verify_single_version(args: Tuple) -> Tuple[str, bool, str]:
 
         # Install package
         pip_path = os.path.join(venv_path, 'bin', 'pip')
+        pypi_package_name = get_pypi_name(package_name)
         result = subprocess.run(
-            [pip_path, 'install', f'{package_name}=={version}'],
+            [pip_path, 'install', f'{pypi_package_name}=={version}'],
             capture_output=True,
             text=True,
             timeout=300
@@ -777,102 +772,118 @@ def replace_import_names_with_pypi_names(data: Dict) -> Dict:
     return result
 
 
-def select_package_versions(compatibility_data: Dict,
-                           mode: str = 'random', max_total_attempts: int = 100) -> Optional[Dict[str, str]]:
-    """Select a valid combination of package versions from compatibility data"""
+import random
+from typing import Dict, Optional
 
-    def select_combination_attempt():
-        """Attempt to select one valid combination"""
-        selected_versions: Dict[str, str] = {}
+def select_package_versions(compatibility_data: Dict, mode: str = 'random') -> Optional[Dict[str, str]]:
+    """
+    Select a valid combination of package versions from compatibility data.
+    Uses exhaustive Depth-First Search (DFS) with backtracking.
+    """
+    selected_versions: Dict[str, str] = {}
 
-        def select_version_recursive(pkg_name: str, available_versions: Dict,
-                                     depth: int = 0) -> bool:
-            """Recursively select versions for a package and its dependencies"""
-            # Check if package already selected
-            if pkg_name in selected_versions:
-                current_version = selected_versions[pkg_name]
-                if current_version not in available_versions:
-                    # Version conflict
-                    return False
-                else:
-                    # Use the existing version and continue with its deps
-                    deps = available_versions[current_version]
-                    if isinstance(deps, dict):
-                        for dep_pkg, dep_versions in deps.items():
-                            if not select_version_recursive(dep_pkg, dep_versions, depth + 1):
-                                return False
-                    return True
+    def select_version_recursive(pkg_name: str, available_versions: Dict, depth: int = 0) -> bool:
+        if not isinstance(available_versions, dict):
+            return False
 
-            # Get available versions list (filter out 'incompatible' key)
-            versions = [v for v in available_versions.keys() if v != 'incompatible']
+        # 1. 获取所有可用版本 (自动过滤掉 'incompatible' 标记)
+        versions = [v for v in available_versions.keys() if v != 'incompatible']
+        
+        # 如果过滤后没有任何有效版本，说明这个包彻底走不通
+        if not versions:
+            return False
 
-            if not versions:
-                # No versions available
+        # 2. 菱形依赖/交叉依赖校验
+        if pkg_name in selected_versions:
+            current_version = selected_versions[pkg_name]
+            if current_version not in versions:
                 return False
-
-            # Select version based on mode
-            if mode == 'random':
-                versions = versions.copy()
-                random.shuffle(versions)
-            elif mode == 'latest':
-                versions = sorted(versions, reverse=True)
-            # 'first' mode keeps original order
-
-            # Try each version
-            for version in versions:
-                # Check if this version is marked as incompatible
-                version_data = available_versions[version]
-                if isinstance(version_data, dict) and version_data.get('incompatible', False):
-                    # Skip this version as it's marked incompatible
-                    continue
-
-                # Save current state for backtracking
-                saved_versions = selected_versions.copy()
-
-                # Select this version
-                selected_versions[pkg_name] = version
-
-                # Process dependencies
-                deps = version_data
-                all_deps_ok = True
-
-                # Check if deps is a dictionary before iterating
+            else:
+                deps = available_versions[current_version]
                 if isinstance(deps, dict):
+                    # 如果已选版本的当前上下文是 incompatible 的，校验失败
+                    if deps.get('incompatible') is True:
+                        return False
+                    
                     for dep_pkg, dep_versions in deps.items():
+                        if dep_pkg == 'incompatible': 
+                            continue
                         if not select_version_recursive(dep_pkg, dep_versions, depth + 1):
-                            all_deps_ok = False
+                            return False
+                return True
+
+        # 3. 决定模式尝试顺序
+        if mode == 'random':
+            versions = versions.copy()
+            random.shuffle(versions)
+        elif mode == 'latest':
+            versions = sorted(versions, reverse=True)
+
+        # 4. 回溯核心：逐个尝试所有版本
+        for version in versions:
+            deps = available_versions[version]
+
+            # ====================================================
+            # [核心修复 1]：单版本精准隔离
+            # 如果当前 version 自己被标记为 incompatible，仅跳过这一个版本！
+            # ====================================================
+            if isinstance(deps, dict) and deps.get('incompatible') is True:
+                continue
+
+            # ====================================================
+            # [核心修复 2]：子依赖深度熔断
+            # 只有当某个子依赖【彻底没有任何可用版本】时，才熔断当前 version
+            # ====================================================
+            has_dead_dep = False
+            if isinstance(deps, dict):
+                for dep_pkg, dep_versions in deps.items():
+                    if dep_pkg == 'incompatible':
+                        continue
+                    
+                    if isinstance(dep_versions, dict):
+                        valid_dep_vars = [v for v in dep_versions.keys() if v != 'incompatible']
+                        if dep_versions.get('incompatible') is True and not valid_dep_vars:
+                            has_dead_dep = True
                             break
+            
+            if has_dead_dep:
+                continue 
 
-                if all_deps_ok:
-                    return True  # Success!
+            # 保存当前状态，进入沙箱尝试
+            saved_versions = selected_versions.copy()
+            selected_versions[pkg_name] = version
+            
+            # 递归处理所有子依赖
+            all_deps_ok = True
+            if isinstance(deps, dict):
+                for dep_pkg, dep_versions in deps.items():
+                    # 过滤掉非包名的内部标记键
+                    if dep_pkg == 'incompatible':
+                        continue
+                        
+                    if not select_version_recursive(dep_pkg, dep_versions, depth + 1):
+                        all_deps_ok = False
+                        break
+            
+            # 如果整棵子树成功，一路向上放行
+            if all_deps_ok:
+                return True 
+            
+            # 撤销尝试，循环将无缝进入 next version
+            selected_versions.clear()
+            selected_versions.update(saved_versions)
 
-                # Backtrack: restore saved state
-                selected_versions.clear()
-                selected_versions.update(saved_versions)
+        # 5. 所有有效 version 都试完了依然不行，触发上层回溯
+        return False
 
-            return False  # No valid version found
+    # 启动解析
+    for root_pkg, versions_data in compatibility_data.items():
+        if not select_version_recursive(root_pkg, versions_data):
+            print(f"[!] Could not find valid version combination. Failed at root package: {root_pkg}")
+            return None
 
-        # Process each root package
-        for root_pkg, versions_data in compatibility_data.items():
-            if not select_version_recursive(root_pkg, versions_data):
-                return None
-
-        return selected_versions if selected_versions else None
-
-    # Try to find a valid combination
-    for attempt in range(max_total_attempts):
-        result = select_combination_attempt()
-
-        if result:
-            print(f"[+] Found valid version combination after {attempt + 1} attempt(s)")
-            return result
-
-        # If mode is not random, no point trying again
-        if mode != 'random':
-            break
-
-    print(f"[!] Could not find valid version combination after {max_total_attempts} attempts")
-    return None
+    print(f"[+] Successfully found a valid version combination!")
+    return selected_versions
 
 
 
@@ -1236,18 +1247,15 @@ def main():
         attempts = 0
         while attempts < max_attempts_per_combo:
             attempts += 1
-            temp_combo = select_package_versions(compatibility_data, args.mode, max_total_attempts=100)
+            temp_combo = select_package_versions(compatibility_data, args.mode)
 
+            # ==========================================
+            # 修复 1：如果 DFS 直接返回 None，说明整棵树彻底无解！
+            # 没必要再试 100 次了，直接 break 熔断。
+            # ==========================================
             if temp_combo is None:
-                print(f"[!] Failed to generate a valid combination (attempt {attempts}/{max_attempts_per_combo})")
-                if attempts == max_attempts_per_combo:
-                    print(f"[!] Could not generate a valid combination after {max_attempts_per_combo} attempts")
-                    print("[!] This may be because:", file=sys.stderr)
-                    print("    - The compatibility file has conflicting version constraints", file=sys.stderr)
-                    print("    - All available versions are marked as incompatible", file=sys.stderr)
-                    print("    - The dependency tree cannot be satisfied", file=sys.stderr)
-                    break
-                continue
+                print(f"[!] DFS exhaustively proved that NO valid combination exists in the compatibility data.")
+                break
 
             # Create a hashable representation to check for duplicates
             combo_key = tuple(sorted(temp_combo.items()))
@@ -1260,9 +1268,13 @@ def main():
             else:
                 print(f"[*] Duplicate combination found, regenerating... (attempt {attempts}/{max_attempts_per_combo})")
 
+        # ==========================================
+        # 修复 2：如果 combo 是 None，说明根本凑不出兼容版本。
+        # 此时应该直接结束整个测试任务（break），而不是 continue 死循环！
+        # ==========================================
         if combo is None:
-            print(f"[!] Skipping test {i} due to failure in generating valid combination")
-            continue
+            print(f"[!] Aborting test sequence due to failure in generating a valid combination.")
+            break
 
         # Create a subdirectory for this test
         test_dir = os.path.join(base_work_dir, f"test_{i}")

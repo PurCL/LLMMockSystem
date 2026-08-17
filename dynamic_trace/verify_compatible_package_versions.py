@@ -65,6 +65,7 @@ from packaging.version import parse as parse_version
 import signal
 import base64
 import pickle
+import trace_generator
 
 
 # ============================================================
@@ -285,10 +286,42 @@ class PackageVersionFetcher:
         """
         if import_name in self.pypi_import_mapping:
             pypi_name = self.pypi_import_mapping[import_name]
-            print(f"[Mapping] Using PyPI package name '{pypi_name}' for import name '{import_name}'")
+            # print(f"[Mapping] Using PyPI package name '{pypi_name}' for import name '{import_name}'")
             return pypi_name
         # Return original name without any conversion
         return import_name
+
+    def is_stdlib_module(self, module_name: str) -> bool:
+        """Check if a module is part of Python standard library"""
+        top_level_name = module_name.split('.')[0]
+        return top_level_name in sys.stdlib_module_names
+
+    def is_valid_pypi_package(self, package_name: str) -> bool:
+        """
+        Check if a package exists on PyPI using its JSON API.
+        """
+        import urllib.request
+        import urllib.error
+
+        if package_name in ['google', 'opentelemetry', 'upath', 'importlib_metadata']:
+            return False
+
+        pypi_name = self.get_pypi_package_name(package_name)
+
+        url = f"https://pypi.org/pypi/{pypi_name}/json"
+
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=3) as response:
+                return response.status == 200
+                
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return False
+            return True
+        except Exception as e:
+            print(f"  [PyPI Check Warning] Network error checking '{pypi_name}': {e}. Assuming valid.")
+            return True
 
     def fetch_all_versions(self, package_name: str) -> List[str]:
         """
@@ -317,9 +350,17 @@ class PackageVersionFetcher:
             # Get all versions
             raw_versions = list(data.get('releases', {}).keys())
 
+            valid_versions = []
+            for version in raw_versions:
+                try:
+                    parse_version(version)  # 尝试解析
+                    valid_versions.append(version)
+                except Exception:
+                    print(f"  Warning: Skipping invalid version '{version}'")
+
             # Sort in descending order using packaging.version.parse
             # reverse=True means from newest to oldest (e.g., 2.10.0 -> 2.9.0 -> 1.0.0)
-            sorted_versions = sorted(raw_versions, key=parse_version, reverse=True)
+            sorted_versions = sorted(valid_versions, key=parse_version, reverse=True)
 
             # Standardize version numbers: replace special characters with underscores
             safe_versions = [version.replace('/', '_').replace(':', '_') for version in sorted_versions]
@@ -330,7 +371,7 @@ class PackageVersionFetcher:
 
         except Exception as e:
             print(f"Error fetching versions for {package_name}: {e}", file=sys.stderr)
-            return set()
+            return []
 
 
 # ============================================================
@@ -823,7 +864,8 @@ class VersionWorker:
                         break  # Current API test passed, exit retry loop, process next API
 
                     # Failure case, try to capture missing package name with regex
-                    missing_match = re.search(r"ModuleNotFoundError: No module named '([^']+)'", stderr)
+                    combined_output = stderr + "\n" + stdout
+                    missing_match = re.search(r"No module named ['\"]([^'\"]+)['\"]", combined_output)
 
                     if missing_match:
                         missing_pkg = missing_match.group(1)
@@ -1014,19 +1056,40 @@ def check_api(api_path: str, is_import: bool, api_type: str, args: list, kwargs:
         return False, f"Invalid API path: {api_path}"
 
     obj = None
+    last_error = f"Could not import any base module for {api_path}"
 
     # Try import from longest path to shortest path
     for i in range(len(parts), 0, -1):
         mod_name = '.'.join(parts[:i])
         try:
             obj = importlib.import_module(mod_name)
+            
+            attr_missing = False
             for attr in parts[i:]:
                 # Strip trailing '()' to support anonymous instantiation syntax parsing
                 clean_attr = attr.replace('()', '')
                 
                 if not hasattr(obj, clean_attr):
-                    return False, f"Attribute '{clean_attr}' not found in {mod_name}"
+                    last_error = f"Attribute '{clean_attr}' not found in {mod_name}"
+                    attr_missing = True
+                    break
                 obj = getattr(obj, clean_attr)
+                
+            # [核心修复 1]：如果属性不存在，不要直接报错退出，继续尝试更短的模块路径
+            if attr_missing:
+                continue
+
+            # === If cross-library import or from_import check, success if target object can be resolved ===
+            if is_import or api_type in ["import", "from_import"]:
+                return True, "Import successful"
+
+            # [核心修复 2]：如果我们需要一个可调用对象（call），但当前找到的是个模块（发生同名覆盖）
+            # 不要立刻宣判死刑，跳过当前结果，退一步寻找真实的 Callable 属性！
+            if not callable(obj):
+                last_error = f"{api_path} resolved to {type(obj).__name__}, which is not callable"
+                continue
+
+            # 完美命中！既存在又 Callable，跳出查找循环
             break
 
         except ModuleNotFoundError as e:
@@ -1035,15 +1098,9 @@ def check_api(api_path: str, is_import: bool, api_type: str, args: list, kwargs:
             # Missing underlying dependency, raise upward
             raise e
 
-    if obj is None:
-        return False, f"Could not import any base module for {api_path}"
-
-    # === If cross-library import or from_import check, success if target object can be resolved ===
-    if is_import or api_type in ["import", "from_import"]:
-        return True, "Import successful"
-
-    if not callable(obj):
-        return False, f"{api_path} is not callable"
+    # 如果所有组合都试过了还是不行，再抛出最终错误
+    if obj is None or (not is_import and api_type not in ["import", "from_import"] and not callable(obj)):
+        return False, last_error
 
     try:
         sig = inspect.signature(obj)
@@ -1169,277 +1226,21 @@ if __name__ == "__main__":
         api_call: dict
     ) -> str:
         """
-        Generate cross-library call analysis script (Boundary Tracer)
+        Generate cross-library call analysis script (Boundary Tracer) utilizing trace_generator
         """
-        import base64
-        import pickle
 
         callee = api_call.get('callee', '')
-        # Externally serialize and encode parameters to avoid any injection-induced SyntaxError
         args_b64 = base64.b64encode(pickle.dumps(api_call.get('args', []))).decode('ascii')
         kwargs_b64 = base64.b64encode(pickle.dumps(api_call.get('kwargs', {}))).decode('ascii')
+
+        import_name = package
+        for imp, pypi in self.venv_manager.pypi_import_mapping.items():
+            if pypi == package:
+                import_name = imp
+                break
         
-        # Removed f-string prefix, allowing normal use of curly braces {} inside
-        script_content = '''#!/usr/bin/env python3
-import sys
-import importlib
-import inspect
-import json
-import base64
-import pickle
-from unittest.mock import MagicMock
-
-def get_api_object(api_path: str, tracer_func=None):
-    def traced_import(mod_name):
-        original_trace = sys.gettrace()
-        if tracer_func:
-            sys.settrace(tracer_func)
-        try:
-            return importlib.import_module(mod_name)
-        finally:
-            if tracer_func:
-                sys.settrace(original_trace)
-
-    parts = api_path.split('.')
-    if len(parts) == 1:
-        return traced_import(parts[0].replace('()', ''))
-
-    for i in range(len(parts) - 1, 0, -1):
-        mod_name = '.'.join(parts[:i])
-        attr_parts = parts[i:]
-        try:
-            obj = traced_import(mod_name)
-            for attr in attr_parts:
-                clean_attr = attr.replace('()', '')
-                obj = getattr(obj, clean_attr)
-            return obj
-        except (ModuleNotFoundError, AttributeError):
-            continue
-            
-    return traced_import(api_path.replace('()', ''))
-
-def safe_repr(val):
-    try:
-        val_type = type(val).__name__
-        if any(keyword in val_type for keyword in ["Tensor", "Variable", "DataFrame", "Series", "ndarray"]):
-            shape = getattr(val, 'shape', '?')
-            dtype = getattr(val, 'dtype', '?')
-            return f"<{val_type}: shape={shape}, dtype={dtype}>"
-        s = repr(val)
-        if len(s) > 1000:
-            return s[:1000] + "... <truncated>"
-        return s
-    except Exception:
-        return "<Unrepresentable Object>"
-
-def generate_mock_kwargs(func_obj):
-    kwargs = {}
-    try:
-        sig = inspect.signature(func_obj)
-        for name, param in sig.parameters.items():
-            if param.default == inspect.Parameter.empty and name not in ('args', 'kwargs'):
-                kwargs[name] = MagicMock()
-    except Exception:
-        pass
-    return kwargs
-
-def main():
-    # Placeholders will be replaced externally by replace()
-    api_path = <<<CALLEE>>>
-    source_pkg = <<<PACKAGE>>>
-    args = pickle.loads(base64.b64decode("<<<ARGS_B64>>>"))
-    kwargs = pickle.loads(base64.b64decode("<<<KWARGS_B64>>>"))
-    
-    recorded_apis = set()
-
-    def tracer(frame, event, arg):
-        if event != 'call':
-            return tracer
-
-        func_name = frame.f_code.co_name
-        if func_name == '<module>':
-            return tracer
-
-        caller_frame = frame.f_back
-        if not caller_frame:
-            return tracer
-
-        caller_mod = caller_frame.f_globals.get("__name__", "")
-        if not caller_mod:
-            return tracer
-
-        # 1. Preserve the actual callee module (for accurate cross-package boundary detection)
-        raw_callee_mod = frame.f_globals.get("__name__", "")
-        if not raw_callee_mod or raw_callee_mod.startswith("namedtuple_"):
-            return tracer
-            
-        # 2. Get downstream_pkg early and filter stdlib (performance optimization: early exit)
-        downstream_pkg = raw_callee_mod.split('.')[0]
-        if downstream_pkg in sys.stdlib_module_names:
-            return tracer
-
-        # 3. Check if caller and callee actually cross package boundaries
-        if caller_mod.startswith(source_pkg) and not raw_callee_mod.startswith(source_pkg):
-            
-            is_instance_method = False
-            cls_obj = None
-
-            if 'self' in frame.f_locals:
-                cls_obj = frame.f_locals['self'].__class__
-                is_instance_method = True
-            elif 'cls' in frame.f_locals:
-                cls_obj = frame.f_locals['cls']
-                if not isinstance(cls_obj, type):
-                    cls_obj = None
-
-            # 4. Dynamically get function object to extract lineage info from __qualname__
-            func_obj_trace = None
-            if cls_obj:
-                func_obj_trace = getattr(cls_obj, func_name, None)
-            else:
-                func_obj_trace = frame.f_globals.get(func_name)
-
-            qualname = getattr(func_obj_trace, '__qualname__', None) if func_obj_trace else None
-
-            # ==========================================================
-            # 🛑 Iron Wall Block 1: Never let any closure pass!
-            # If it's an internal closure function, discard it directly, never let it enter fallback logic!
-            # ==========================================================
-            if qualname and '<locals>' in qualname:
-                return tracer
-
-            # ==========================================================
-            # 🛑 Iron Wall Block 2: Check the module's global namespace!
-            # Verify if it actually exists in the current module's global variables.
-            # This perfectly blocks hidden internal functions whose qualname was disguised by @wraps.
-            # ==========================================================
-            if qualname:
-                root_obj_name = qualname.split('.')[0]
-                if root_obj_name not in frame.f_globals:
-                    return tracer
-            else:
-                if func_name not in frame.f_globals:
-                    return tracer
-
-            # 5. Construct perfect API signature
-            if qualname:
-                if is_instance_method and '.' in qualname:
-                    parts = qualname.rsplit('.', 1)
-                    api_signature = f"{raw_callee_mod}.{parts[0]}().{parts[1]}"
-                else:
-                    api_signature = f"{raw_callee_mod}.{qualname}"
-            else:
-                # Fallback degradation plan
-                class_name = cls_obj.__name__ if cls_obj else ""
-                if class_name:
-                    if func_name == '__init__':
-                        api_signature = f"{raw_callee_mod}.{class_name}"
-                    elif is_instance_method:
-                        api_signature = f"{raw_callee_mod}.{class_name}().{func_name}"
-                    else:
-                        api_signature = f"{raw_callee_mod}.{class_name}.{func_name}"
-                else:
-                    api_signature = f"{raw_callee_mod}.{func_name}"
-
-            # Logging logic
-            if api_signature not in recorded_apis:
-                recorded_apis.add(api_signature)
-
-                try:
-                    sig_trace = inspect.signature(func_obj_trace) if func_obj_trace else None
-                except Exception:
-                    sig_trace = None
-
-                arg_info = inspect.getargvalues(frame)
-                args_dict = {}
-                
-                for arg_name in arg_info.args:
-                    if arg_name in ('self', 'cls'):
-                        continue
-                        
-                    val = arg_info.locals.get(arg_name)
-
-                    if sig_trace and arg_name in sig_trace.parameters:
-                        param = sig_trace.parameters[arg_name]
-                        if param.default is not inspect.Parameter.empty:
-                            try:
-                                if val == param.default:
-                                    continue
-                            except Exception:
-                                pass
-
-                    args_dict[arg_name] = safe_repr(val)
-
-                if arg_info.varargs:
-                    val = arg_info.locals.get(arg_info.varargs)
-                    args_dict[arg_info.varargs] = safe_repr(val)
-                    
-                if arg_info.keywords:
-                    val = arg_info.locals.get(arg_info.keywords)
-                    args_dict[arg_info.keywords] = safe_repr(val)
-
-                call_record = {
-                    "type": "call",
-                    "downstream_package": downstream_pkg,
-                    "downstream_api": api_signature,
-                    "called_by": f"{caller_mod}.{caller_frame.f_code.co_name}",
-                    "args": args_dict
-                }
-                # Streaming output to ensure capturing pre-crash state
-                print(f"[BOUNDARY_CALL]{json.dumps(call_record)}", flush=True)
-
-        return tracer
-
-    # --- Execution Controller ---
-    def execute_with_trace(*run_args, **run_kwargs):
-        nonlocal recorded_apis
-        recorded_apis.clear()
-
-        original_trace = sys.gettrace()
-        try:
-            sys.settrace(tracer)
-            func_obj(*run_args, **run_kwargs)
-            return True, "Execution completed normally"
-        except Exception as e:
-            return False, f"{type(e).__name__}: {str(e)}"
-        finally:
-            sys.settrace(original_trace)
-
-    try:
-        func_obj = get_api_object(api_path, tracer)
-    except Exception as e:
-        sys.stderr.write(f"Import error: {str(e)}\\n")
-        sys.exit(3)
-
-    if func_obj is None or not callable(func_obj):
-        sys.stderr.write(f"{api_path} is not callable or not found\\n")
-        sys.exit(1)
-
-    success, msg = execute_with_trace(*args, **kwargs)
-
-    if not success:
-        sys.stderr.write(f"Original args failed with: {msg}. Retrying with MagicMock...\\n")
-        mock_kwargs = generate_mock_kwargs(func_obj)
-        success_mock, msg_mock = execute_with_trace(**mock_kwargs)
-
-        if not success_mock:
-            sys.stderr.write(f"Mock args also failed with: {msg_mock}\\n")
-
-    sys.exit(0)
-
-if __name__ == "__main__":
-    main()
-'''
-        # Chained replace for safe parameter injection
-        return script_content.replace(
-            "<<<CALLEE>>>", repr(callee)
-        ).replace(
-            "<<<PACKAGE>>>", repr(package)
-        ).replace(
-            "<<<ARGS_B64>>>", args_b64
-        ).replace(
-            "<<<KWARGS_B64>>>", kwargs_b64
-        )
+        # 极简调用，彻底消除维护负担
+        return trace_generator.get_boundary_trace_code(callee, import_name, args_b64, kwargs_b64)
 
     def _run_trace_script(self,
         script_content: str,
@@ -1472,290 +1273,7 @@ if __name__ == "__main__":
         except Exception as e:
             return False, "", f"Error running API trace script: {str(e)}"
 
-
-# ============================================================
-# Module 7: Result Saving Module - Save Test Results
-# ============================================================
-
-class ResultSaver:
-    """Responsible for saving test results to JSON file"""
-
-    @staticmethod
-    def save_results(
-        package_name: str,
-        results: List[Dict],
-        apis_dir: str,
-        version_mapping_file: str
-    ):
-        """
-        Save test results
-
-        Args:
-            package_name: Package name
-            results: Result list
-            apis_dir: API file directory
-            version_mapping_file: version_mapping file path
-        """
-        if not results:
-            print("No results to save")
-            return
-
-        compatiblity_file = os.path.join(apis_dir, f"{package_name}_compatibility_results.json")
-        if os.path.exists(version_mapping_file):
-            # Dependency package scenario: output version combinations
-            compatible_version_combinations = []
-            incompatible_upstream_versions_sets = []
-
-            for r in results:
-                if r and r.get('status') == 'compatible' and r.get('compatible_upstream_versions'):
-                    for upstream_version in r['compatible_upstream_versions']:
-                        compatible_version_combinations.append({
-                            'downstream_version': r['version'],
-                            'upstream_version': upstream_version,
-                            'supported_api_ids': r.get('supported_api_ids', [])
-                        })
-                incompatible_upstream_versions_set = set(r['incompatible_upstream_versions'])
-                incompatible_upstream_versions_sets.append(incompatible_upstream_versions_set)
-
-            common_incompatible_upstream_versions = list(set.intersection(*incompatible_upstream_versions_sets))
-
-            output_data = {
-                'type': 'dependency_compatibility',
-                'package_name': package_name,
-                'compatible_version_combinations': compatible_version_combinations,
-                'total_combinations': len(compatible_version_combinations),
-                'incompatible_upstream_versions': sorted(common_incompatible_upstream_versions)
-            }
-
-            with open(compatiblity_file, 'w') as f:
-                json.dump(output_data, f, indent=2)
-
-            print(f"\n{'='*60}")
-            print(f"Results saved to: {compatiblity_file}")
-            print(f"{'='*60}")
-            print(f"Summary:")
-            print(f"  Total compatible version combinations: {len(compatible_version_combinations)}")
-        else:
-            # User code scenario: output compatible/incompatible versions
-            compatible_versions = []
-            incompatible_versions = []
-
-            for r in results:
-                if r and 'status' in r and 'version' in r:
-                    if r['status'] == 'compatible':
-                        compatible_versions.append({
-                            'version': r['version'],
-                            'supported_api_ids': r.get('supported_api_ids', [])
-                        })
-                    elif r['status'] == 'incompatible':
-                        incompatible_versions.append({
-                            'version': r['version'],
-                            'unsupported_api_ids': r.get('unsupported_api_ids', dict()),
-                            'error_message': r.get('error_message', '')
-                        })
-
-            output_data = {
-                'type': 'user_code_compatibility',
-                'package_name': package_name,
-                'compatible': compatible_versions,
-                'incompatible': incompatible_versions
-            }
-
-            with open(compatiblity_file, 'w') as f:
-                json.dump(output_data, f, indent=2)
-
-            # Calculate statistics
-            total = len(results)
-            compatible_count = len(compatible_versions)
-            incompatible_count = len(incompatible_versions)
-            compatibility_rate = f"{(compatible_count/total*100):.2f}%" if total > 0 else "0%"
-
-            print(f"\n{'='*60}")
-            print(f"Results saved to: {compatiblity_file}")
-            print(f"{'='*60}")
-            print(f"Summary:")
-            print(f"  Total versions tested: {total}")
-            print(f"  Compatible: {compatible_count}")
-            print(f"  Incompatible: {incompatible_count}")
-            print(f"  Compatibility rate: {compatibility_rate}")
-
-        ResultSaver.generate_api_logs_and_mapping(results, package_name, apis_dir)
-
-    @staticmethod
-    def generate_api_logs_and_mapping(results, package_name, apis_dir):
-        """
-        Process all version traces, deduplicate and generate downstream library api_log and version_mapping
-
-        :param results: List containing trace results for each version
-        :param package_name: Target library name (e.g., 'keras')
-        :param apis_dir: Parent directory for API logs output
-        """
-        # 1. Create output directory
-        api_log_dir = os.path.join(apis_dir, f"{package_name}_api_log")
-        os.makedirs(api_log_dir, exist_ok=True)
-
-        # Used to store mapping from downstream package to specific API info
-        # Structure: package_to_apis[downstream_pkg][unique_key] = api_info_dict
-        package_to_apis = defaultdict(dict)
-
-        # Used to store which newly assigned downstream API IDs each version contains
-        # Structure: version_mapping[version] = set(api_ids)
-        version_mapping = defaultdict(set)
-
-        global_api_id = 1
-
-        def normalize_args(args_dict):
-            """Clean dynamic memory addresses and Mock IDs in args for precise deduplication"""
-            args_str = json.dumps(args_dict, sort_keys=True)
-            # Replace Python object memory addresses: 0x7fa6c2da8e50 -> 0xXXX
-            args_str = re.sub(r'0x[0-9a-fA-F]+', '0xXXX', args_str)
-            # Replace MagicMock id: id='140299277876144' -> id='XXX'
-            args_str = re.sub(r"id='\d+'", "id='XXX'", args_str)
-            return args_str
-
-        print(f"[*] Aggregating and analyzing cross-library boundary calls...")
-
-        # 2. Iterate through all results, extract and deduplicate downstream API calls
-        for result in results:
-            # Assume your result has version identifier, if not, adjust to your version field
-            version = result.get('version', 'unknown_version')
-            api_traces = result.get('api_traces', {})
-
-            for original_api_id, trace_data in api_traces.items():
-                trace_list = trace_data.get('trace', [])
-
-                for line in trace_list:
-                    # Intercept both CALL and IMPORT
-                    if line.startswith('[BOUNDARY_CALL]') or line.startswith('[BOUNDARY_IMPORT]') or line.startswith('[BOUNDARY_FROM_IMPORT]'):
-                        if line.startswith('[BOUNDARY_CALL]'):
-                            prefix = '[BOUNDARY_CALL]'
-                        elif line.startswith('[BOUNDARY_FROM_IMPORT]'):
-                            prefix = '[BOUNDARY_FROM_IMPORT]'
-                        else:
-                            prefix = '[BOUNDARY_IMPORT]'
-                        json_str = line.replace(prefix, '').strip()
-
-                        try:
-                            call_record = json.loads(json_str)
-                        except json.JSONDecodeError:
-                            continue
-
-                        downstream_pkg = call_record.get('downstream_package', 'unknown')
-                        record_type = call_record.get('type', 'call')
-                        called_by = call_record.get('called_by', 'unknown')
-
-                        if record_type == 'call':
-                            downstream_api = call_record.get('downstream_api', 'unknown')
-                            args_dict = call_record.get('args', {})
-                            # Generate deduplication unique key: API name + cleaned parameter structure
-                            norm_args_str = normalize_args(args_dict)
-                            unique_key = f"call::{downstream_api}::{norm_args_str}"
-                        elif prefix == '[BOUNDARY_FROM_IMPORT]':
-                            downstream_api = call_record.get('downstream_module', 'unknown')
-                            imported_names = call_record.get('imported_names', [])
-                            args_dict = {"imported_names": imported_names}
-                            names_str = ",".join(sorted(imported_names))
-                            unique_key = f"from_import::{downstream_api}::{names_str}"
-                        else:
-                            # For import type, target is specific module
-                            downstream_api = call_record.get('downstream_module', 'unknown')
-                            args_dict = {}  # import behavior has no parameters
-                            # Generate deduplication unique key: only need to mark as import and add module name
-                            unique_key = f"import::{downstream_api}"
-
-                        # Discover brand new downstream API call or cross-library import
-                        if unique_key not in package_to_apis[downstream_pkg]:
-                            package_to_apis[downstream_pkg][unique_key] = {
-                                "api_id": global_api_id,
-                                "type": record_type,          # Mark type for convenient downstream generation of corresponding test script format
-                                "api_name": downstream_api,   # Function signature for call, module name for import
-                                "called_by": called_by,
-                                "args_dict": args_dict,       # Empty dict for import
-                                "versions": set()
-                            }
-                            global_api_id += 1
-
-                        # Bind this API/Import with current Version
-                        api_info = package_to_apis[downstream_pkg][unique_key]
-                        api_info["versions"].add(version)
-                        version_mapping[version].add(api_info["api_id"])
-
-        # 3. Generate {downstream_package}_apis.py and corresponding version_mapping.json by downstream package
-        print(f"[*] Generating API Log scripts (found {global_api_id - 1} unique calls in total)...")
-        for pkg, apis in package_to_apis.items():
-
-            # ==================== 3a. Generate {pkg}_apis.py ====================
-            file_path = os.path.join(api_log_dir, f"{pkg}_apis.py")
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(f"# API Calls for {pkg}\n")
-                f.write(f"# Auto-extracted boundary calls originating from {package_name}\n\n")
-
-                # Sort by API ID in ascending order to ensure file looks neat
-                sorted_apis = sorted(apis.values(), key=lambda x: x["api_id"])
-                for api in sorted_apis:
-                    api_id = api["api_id"]
-                    versions_str = ", ".join(sorted(api["versions"]))
-                    api_name = api["api_name"]
-                    called_by = api["called_by"]
-                    api_type = api.get("type", "call")  # Get type, defaults to call
-
-                    # Generate different test code based on different types
-                    if api_type == "call":
-                        # Reassemble dict into kwargs style string
-                        args_parts = []
-                        for k, v in api["args_dict"].items():
-                            args_parts.append(f"{k}={v}")
-                        args_str = ", ".join(args_parts)
-                        # Generate code form similar to keras.layers.Input(...)
-                        executable_code = f"{api_name}({args_str})"
-                    elif api_type == "from_import":
-                        imported_names = api_info.get("args_dict", {}).get("imported_names", [])
-                        
-                        check_lines = [
-                            f"mod = importlib.import_module('{api_name}')"
-                        ]
-                        
-                        for name in imported_names:
-                            check_lines.append(
-                                f"if not hasattr(mod, '{name}'): raise ImportError(\"cannot import name '{name}' from '{api_name}'\")"
-                            )
-
-                        executable_code = "\n".join(check_lines)
-                    elif api_type == "import":
-                        # For import behavior, use dynamic import to verify compatibility (success if no ModuleNotFoundError)
-                        executable_code = f"importlib.import_module('{api_name}')"
-                    else:
-                        executable_code = f"# Unknown API type: {api_type}"
-
-                    f.write(f"# API ID: {api_id}\n")
-                    f.write(f"# Found in versions: {versions_str}\n")
-                    f.write(f"# Type: {api_type}\n")
-                    f.write(f"# Target: {api_name}\n")
-                    f.write(f"# Call chain: {called_by}\n")
-                    f.write(f"{executable_code}\n\n")
-
-            # ==================== 4. Generate {pkg}_version_mapping.json ====================
-            # Dynamically count api_id set corresponding to each version in current downstream package
-            pkg_version_mapping = {}
-            for api in apis.values():
-                api_id = api["api_id"]
-                for ver in api["versions"]:
-                    if ver not in pkg_version_mapping:
-                        pkg_version_mapping[ver] = set()
-                    pkg_version_mapping[ver].add(api_id)
-
-            # Convert set to sorted list for json serialization
-            final_mapping = {
-                ver: sorted(list(ids))
-                for ver, ids in pkg_version_mapping.items()
-            }
-
-            # Modify filename to be named after current downstream package pkg
-            mapping_file = os.path.join(api_log_dir, f"{pkg}_version_mapping.json")
-            with open(mapping_file, 'w', encoding='utf-8') as f:
-                json.dump(final_mapping, f, indent=4)
-
-        print(f"[+] Successfully generated API Log directory: {api_log_dir}")
+    
 
 
 # ============================================================
@@ -1944,7 +1462,7 @@ class CompatibilityTester:
 
         version_mapping_file = os.path.join(apis_dir, f"{package_name}_version_mapping.json")
 
-        ResultSaver.save_results(package_name, results, apis_dir, version_mapping_file)
+        self.save_results(package_name, results, apis_dir, version_mapping_file)
 
     @staticmethod
     def _load_pypi_import_mapping(mapping_file: str) -> Dict[str, str]:
@@ -1967,6 +1485,289 @@ class CompatibilityTester:
         except Exception as e:
             print(f"Warning: Failed to load mapping file {mapping_file}: {e}")
             return {}
+
+    def save_results(
+        self,
+        package_name: str,
+        results: List[Dict],
+        apis_dir: str,
+        version_mapping_file: str
+    ):
+        """
+        Save test results
+
+        Args:
+            package_name: Package name
+            results: Result list
+            apis_dir: API file directory
+            version_mapping_file: version_mapping file path
+        """
+        if not results:
+            print("No results to save")
+            return
+
+        compatiblity_file = os.path.join(apis_dir, f"{package_name}_compatibility_results.json")
+        if os.path.exists(version_mapping_file):
+            # Dependency package scenario: output version combinations
+            compatible_version_combinations = []
+            incompatible_upstream_versions_sets = []
+
+            for r in results:
+                if r and r.get('status') == 'compatible' and r.get('compatible_upstream_versions'):
+                    for upstream_version in r['compatible_upstream_versions']:
+                        compatible_version_combinations.append({
+                            'downstream_version': r['version'],
+                            'upstream_version': upstream_version,
+                            'supported_api_ids': r.get('supported_api_ids', [])
+                        })
+                incompatible_upstream_versions_set = set(r['incompatible_upstream_versions'])
+                incompatible_upstream_versions_sets.append(incompatible_upstream_versions_set)
+
+            common_incompatible_upstream_versions = list(set.intersection(*incompatible_upstream_versions_sets))
+
+            output_data = {
+                'type': 'dependency_compatibility',
+                'package_name': package_name,
+                'compatible_version_combinations': compatible_version_combinations,
+                'total_combinations': len(compatible_version_combinations),
+                'incompatible_upstream_versions': sorted(common_incompatible_upstream_versions)
+            }
+
+            with open(compatiblity_file, 'w') as f:
+                json.dump(output_data, f, indent=2)
+
+            print(f"\n{'='*60}")
+            print(f"Results saved to: {compatiblity_file}")
+            print(f"{'='*60}")
+            print(f"Summary:")
+            print(f"  Total compatible version combinations: {len(compatible_version_combinations)}")
+        else:
+            # User code scenario: output compatible/incompatible versions
+            compatible_versions = []
+            incompatible_versions = []
+
+            for r in results:
+                if r and 'status' in r and 'version' in r:
+                    if r['status'] == 'compatible':
+                        compatible_versions.append({
+                            'version': r['version'],
+                            'supported_api_ids': r.get('supported_api_ids', [])
+                        })
+                    elif r['status'] == 'incompatible':
+                        incompatible_versions.append({
+                            'version': r['version'],
+                            'unsupported_api_ids': r.get('unsupported_api_ids', dict()),
+                            'error_message': r.get('error_message', '')
+                        })
+
+            output_data = {
+                'type': 'user_code_compatibility',
+                'package_name': package_name,
+                'compatible': compatible_versions,
+                'incompatible': incompatible_versions
+            }
+
+            with open(compatiblity_file, 'w') as f:
+                json.dump(output_data, f, indent=2)
+
+            # Calculate statistics
+            total = len(results)
+            compatible_count = len(compatible_versions)
+            incompatible_count = len(incompatible_versions)
+            compatibility_rate = f"{(compatible_count/total*100):.2f}%" if total > 0 else "0%"
+
+            print(f"\n{'='*60}")
+            print(f"Results saved to: {compatiblity_file}")
+            print(f"{'='*60}")
+            print(f"Summary:")
+            print(f"  Total versions tested: {total}")
+            print(f"  Compatible: {compatible_count}")
+            print(f"  Incompatible: {incompatible_count}")
+            print(f"  Compatibility rate: {compatibility_rate}")
+
+        self.generate_api_logs_and_mapping(results, package_name, apis_dir)
+
+    def generate_api_logs_and_mapping(self, results, package_name, apis_dir):
+        """
+        Process all version traces, deduplicate and generate downstream library api_log and version_mapping
+
+        :param results: List containing trace results for each version
+        :param package_name: Target library name (e.g., 'keras')
+        :param apis_dir: Parent directory for API logs output
+        """
+        # 1. Create output directory
+        api_log_dir = os.path.join(apis_dir, f"{package_name}_api_log")
+        os.makedirs(api_log_dir, exist_ok=True)
+
+        # Used to store mapping from downstream package to specific API info
+        # Structure: package_to_apis[downstream_pkg][unique_key] = api_info_dict
+        package_to_apis = defaultdict(dict)
+
+        # Used to store which newly assigned downstream API IDs each version contains
+        # Structure: version_mapping[version] = set(api_ids)
+        version_mapping = defaultdict(set)
+
+        global_api_id = 1
+
+        def normalize_args(args_dict):
+            """Clean dynamic memory addresses and Mock IDs in args for precise deduplication"""
+            args_str = json.dumps(args_dict, sort_keys=True)
+            # Replace Python object memory addresses: 0x7fa6c2da8e50 -> 0xXXX
+            args_str = re.sub(r'0x[0-9a-fA-F]+', '0xXXX', args_str)
+            # Replace MagicMock id: id='140299277876144' -> id='XXX'
+            args_str = re.sub(r"id='\d+'", "id='XXX'", args_str)
+            return args_str
+
+        print(f"[*] Aggregating and analyzing cross-library boundary calls...")
+
+        # 2. Iterate through all results, extract and deduplicate downstream API calls
+        for result in results:
+            # Assume your result has version identifier, if not, adjust to your version field
+            version = result.get('version', 'unknown_version')
+            api_traces = result.get('api_traces', {})
+
+            for original_api_id, trace_data in api_traces.items():
+                trace_list = trace_data.get('trace', [])
+
+                for line in trace_list:
+                    # Intercept both CALL and IMPORT
+                    if line.startswith('[BOUNDARY_CALL]') or line.startswith('[BOUNDARY_IMPORT]') or line.startswith('[BOUNDARY_FROM_IMPORT]'):
+                        if line.startswith('[BOUNDARY_CALL]'):
+                            prefix = '[BOUNDARY_CALL]'
+                        elif line.startswith('[BOUNDARY_FROM_IMPORT]'):
+                            prefix = '[BOUNDARY_FROM_IMPORT]'
+                        else:
+                            prefix = '[BOUNDARY_IMPORT]'
+                        json_str = line.replace(prefix, '').strip()
+
+                        try:
+                            call_record = json.loads(json_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                        downstream_pkg = call_record.get('downstream_package', 'unknown')
+                        if self.version_fetcher.is_stdlib_module(downstream_pkg) or not self.version_fetcher.is_valid_pypi_package(downstream_pkg):
+                            continue  # Skip standard library or non-PyPI packages 
+                            
+                        pypi_downstream_pkg = self.pypi_import_mapping.get(downstream_pkg, downstream_pkg) 
+
+                        record_type = call_record.get('type', 'call')
+                        called_by = call_record.get('called_by', 'unknown')
+
+                        if record_type == 'call':
+                            downstream_api = call_record.get('downstream_api', 'unknown')
+                            args_list = call_record.get('args_list', [])
+                            kwargs_dict = call_record.get('kwargs_dict', {})
+                            # Generate deduplication unique key: API name + cleaned parameter structure
+                            norm_args_str = normalize_args({"args": args_list, "kwargs": kwargs_dict})
+                            unique_key = f"call::{downstream_api}::{norm_args_str}"
+                        elif prefix == '[BOUNDARY_FROM_IMPORT]':
+                            downstream_api = call_record.get('downstream_module', 'unknown')
+                            imported_names = call_record.get('imported_names', [])
+                            args_dict = {"imported_names": imported_names}
+                            names_str = ",".join(sorted(imported_names))
+                            unique_key = f"from_import::{downstream_api}::{names_str}"
+                        else:
+                            # For import type, target is specific module
+                            downstream_api = call_record.get('downstream_module', 'unknown')
+                            args_dict = {}  # import behavior has no parameters
+                            # Generate deduplication unique key: only need to mark as import and add module name
+                            unique_key = f"import::{downstream_api}"
+
+                        # Discover brand new downstream API call or cross-library import
+                        if unique_key not in package_to_apis[pypi_downstream_pkg]:
+                            package_to_apis[pypi_downstream_pkg][unique_key] = {
+                                "api_id": global_api_id,
+                                "type": record_type,          
+                                "api_name": downstream_api,   
+                                "called_by": called_by,
+                                "args_list": args_list if record_type == 'call' else [],
+                                "kwargs_dict": kwargs_dict if record_type == 'call' else {},
+                                "args_dict": call_record.get('args', {}) if record_type != 'call' else {},
+                                "versions": set()
+                            }
+                            global_api_id += 1
+
+                        # Bind this API/Import with current Version
+                        api_info = package_to_apis[pypi_downstream_pkg][unique_key]
+                        api_info["versions"].add(version)
+                        version_mapping[version].add(api_info["api_id"])
+
+        # 3. Generate {downstream_package}_apis.py and corresponding version_mapping.json by downstream package
+        print(f"[*] Generating API Log scripts (found {global_api_id - 1} unique calls in total)...")
+        for pkg, apis in package_to_apis.items():
+
+            # ==================== 3a. Generate {pkg}_apis.py ====================
+            file_path = os.path.join(api_log_dir, f"{pkg}_apis.py")
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(f"# API Calls for {pkg}\n")
+                f.write(f"# Auto-extracted boundary calls originating from {package_name}\n\n")
+
+                # Sort by API ID in ascending order to ensure file looks neat
+                sorted_apis = sorted(apis.values(), key=lambda x: x["api_id"])
+                for api in sorted_apis:
+                    api_id = api["api_id"]
+                    versions_str = ", ".join(sorted(api["versions"]))
+                    api_name = api["api_name"]
+                    called_by = api["called_by"]
+                    api_type = api.get("type", "call")  # Get type, defaults to call
+
+                    # Generate different test code based on different types
+                    if api_type == "call":
+                        # Reassemble dict into kwargs style string
+                        args_str_list = api["args_list"]
+                        kwargs_str_list = [f"{k}={v}" for k, v in api["kwargs_dict"].items()]
+                        all_args = ", ".join(args_str_list + kwargs_str_list)
+                        
+                        executable_code = f"{api_name}({all_args})"
+                    elif api_type == "from_import":
+                        imported_names = api_info.get("args_dict", {}).get("imported_names", [])
+                        
+                        check_lines = [
+                            f"mod = importlib.import_module('{api_name}')"
+                        ]
+                        
+                        for name in imported_names:
+                            check_lines.append(
+                                f"if not hasattr(mod, '{name}'): raise ImportError(\"cannot import name '{name}' from '{api_name}'\")"
+                            )
+
+                        executable_code = "\n".join(check_lines)
+                    elif api_type == "import":
+                        # For import behavior, use dynamic import to verify compatibility (success if no ModuleNotFoundError)
+                        executable_code = f"importlib.import_module('{api_name}')"
+                    else:
+                        executable_code = f"# Unknown API type: {api_type}"
+
+                    f.write(f"# API ID: {api_id}\n")
+                    f.write(f"# Found in versions: {versions_str}\n")
+                    f.write(f"# Type: {api_type}\n")
+                    f.write(f"# Target: {api_name}\n")
+                    f.write(f"# Call chain: {called_by}\n")
+                    f.write(f"{executable_code}\n\n")
+
+            # ==================== 4. Generate {pkg}_version_mapping.json ====================
+            # Dynamically count api_id set corresponding to each version in current downstream package
+            pkg_version_mapping = {}
+            for api in apis.values():
+                api_id = api["api_id"]
+                for ver in api["versions"]:
+                    if ver not in pkg_version_mapping:
+                        pkg_version_mapping[ver] = set()
+                    pkg_version_mapping[ver].add(api_id)
+
+            # Convert set to sorted list for json serialization
+            final_mapping = {
+                ver: sorted(list(ids))
+                for ver, ids in pkg_version_mapping.items()
+            }
+
+            # Modify filename to be named after current downstream package pkg
+            mapping_file = os.path.join(api_log_dir, f"{pkg}_version_mapping.json")
+            with open(mapping_file, 'w', encoding='utf-8') as f:
+                json.dump(final_mapping, f, indent=4)
+
+        print(f"[+] Successfully generated API Log directory: {api_log_dir}")
 
 
 # ============================================================

@@ -3,16 +3,16 @@
 Recursive API Analysis Pipeline
 This script automates the process of:
 1. Extracting library calls from a script
-2. Verifying package version compatibility (包含trace功能)
+2. Verifying package version compatibility
 3. Recursively processing newly discovered APIs until depth limit reached
 4. Extracting version compatibility results
 5. Running end-to-end verification tests
 
 Usage:
-    python3 run_recursive_api_analysis.py <script_path> --CVE <cve_id>
+    python3 run_recursive_api_analysis.py <script_path> --CVE <cve_id> --requirements <requirements_file>
 
 Example:
-    python3 run_recursive_api_analysis.py /path/to/run_exploit.sh --CVE CVE-2026-1462
+    python3 run_recursive_api_analysis.py /path/to/run_exploit.sh --CVE CVE-2026-1462 --requirements requirements.txt
 """
 
 import os
@@ -29,7 +29,7 @@ import requests
 class RecursiveAPIAnalyzer:
     """Main controller for recursive API analysis pipeline"""
 
-    def __init__(self, script_path: str, cve_id: str, max_depth: int = 10, package: str = None, versions: List[str] = None, vulnerable_packages: Dict[str, List[str]] = None):
+    def __init__(self, script_path: str, cve_id: str, max_depth: int = 10, package: str = None, versions: List[str] = None, vulnerable_packages: Dict[str, List[str]] = None, requirements: str = None):
         self.script_path = Path(script_path).absolute()
         self.cve_id = cve_id
         self.api_log_dir = Path(f"{cve_id}_api_log").absolute()
@@ -38,6 +38,7 @@ class RecursiveAPIAnalyzer:
         self.package = package
         self.versions = versions
         self.vulnerable_packages = vulnerable_packages or {}
+        self.requirements = requirements
 
         # Track processed directories to avoid infinite loops
         self.processed_dirs = set()
@@ -139,7 +140,8 @@ class RecursiveAPIAnalyzer:
             'python3',
             str(self.base_dir / 'extract_library_calls.py'),
             str(self.script_path),
-            str(self.api_log_dir)
+            str(self.api_log_dir),
+            str(self.requirements)
         ]
 
         success, stdout, stderr = self.run_command(
@@ -160,7 +162,7 @@ class RecursiveAPIAnalyzer:
         return sorted(api_files)
 
     def step2_verify_compatibility(self, api_file: Path) -> Tuple[bool, Path]:
-        """Step 2: Verify package version compatibility (包含trace功能)"""
+        """Step 2: Verify package version compatibility"""
         package_name = api_file.stem.replace('_apis', '')
 
         print(f"\n{'#'*60}")
@@ -186,7 +188,7 @@ class RecursiveAPIAnalyzer:
 
         success, stdout, stderr = self.run_command(
             cmd,
-            f"Verifying compatible versions for {package_name} (包含trace)"
+            f"Verifying compatible versions for {package_name}"
         )
 
         if not success:
@@ -204,7 +206,7 @@ class RecursiveAPIAnalyzer:
         return True, compatibility_json
 
     def check_api_log_generated(self, api_file: Path) -> Tuple[bool, Path]:
-        """检查是否生成了下游API log目录"""
+        """Check if downstream API log directory was generated"""
         package_name = api_file.stem.replace('_apis', '')
         output_dir = api_file.parent / f"{package_name}_api_log"
 
@@ -260,13 +262,13 @@ class RecursiveAPIAnalyzer:
             #     print(f"⚠️ Skipping {package_name} as it is not 'keras' or 'tensorflow'")
             #     continue
 
-            # Step 2: Verify compatibility (包含trace功能)
+            # Step 2: Verify compatibility
             success, compatibility_json = self.step2_verify_compatibility(api_file)
             if not success:
                 print(f"⚠️ Skipping {api_file.name} due to compatibility verification failure")
                 continue
 
-            # 检查是否生成了下游API log
+            # Check if downstream API log was generated
             has_api_log, output_dir = self.check_api_log_generated(api_file)
 
             if has_api_log and output_dir:
@@ -348,15 +350,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Example:
-  python3 run_recursive_api_analysis.py /home/user/run_exploit.sh --CVE CVE-2026-1462
-  python3 run_recursive_api_analysis.py /home/user/run_exploit.sh --CVE CVE-2026-1462 --max_depth 5
-  python3 run_recursive_api_analysis.py /home/user/run_exploit.sh --CVE CVE-2026-1462 --package keras --versions 2.10.0 2.9.0
-  python3 run_recursive_api_analysis.py /home/user/run_exploit.sh --CVE CVE-2026-1462 --vulnerable-file /path/to/vulnerable.json
+  python3 run_recursive_api_analysis.py /home/user/run_exploit.sh --CVE CVE-2026-1462 --requirements requirements.txt
+  python3 run_recursive_api_analysis.py /home/user/run_exploit.sh --CVE CVE-2026-1462 --requirements requirements.txt --max_depth 5
+  python3 run_recursive_api_analysis.py /home/user/run_exploit.sh --CVE CVE-2026-1462 --requirements requirements.txt --package keras --versions 2.10.0 2.9.0
+  python3 run_recursive_api_analysis.py /home/user/run_exploit.sh --CVE CVE-2026-1462 --requirements requirements.txt --vulnerable-file /path/to/vulnerable.json
 
 Description:
   This script automates the entire API analysis pipeline:
   1. Extracts library calls from the target script
-  2. Verifies version compatibility for each library (包含trace功能)
+  2. Verifies version compatibility for each library
   3. Recursively processes newly discovered APIs
   4. Extracts version compatibility results to {CVE}-compatibility.json
   5. Records timing statistics to {CVE}-statistics.json
@@ -372,6 +374,7 @@ Description:
     parser.add_argument('--package', type=str, help='Specific package name to apply version filtering')
     parser.add_argument('--versions', nargs='+', type=str, help='List of versions to test for the specified package')
     parser.add_argument('--vulnerable-file', type=str, help='Path to JSON file containing vulnerable packages (format: {"package": ["version1", "version2"]})')
+    parser.add_argument('--requirements', type=str, required=True, help='Path to requirements.txt file')
 
     args = parser.parse_args()
 
@@ -389,6 +392,10 @@ Description:
     # Validate inputs
     if not Path(args.script_path).exists():
         print(f"❌ Error: Script not found: {args.script_path}")
+        sys.exit(1)
+
+    if not Path(args.requirements).exists():
+        print(f"❌ Error: Requirements file not found: {args.requirements}")
         sys.exit(1)
 
     # Load vulnerable packages from JSON file if provided
@@ -432,7 +439,8 @@ Description:
         args.max_depth,
         args.package,
         args.versions,
-        vulnerable_packages
+        vulnerable_packages,
+        args.requirements
     )
     success = analyzer.run()
 
