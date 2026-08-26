@@ -1034,114 +1034,116 @@ class VersionWorker:
         package: str,
         api_call: dict
     ) -> str:
-        """
-        Generate Python script for checking single API / Import detection.
-        Returns code 0 on success, non-0 on failure. Missing package errors are written to stderr for outer Worker to capture.
-        """
         callee = api_call.get('callee', '')
         api_type = api_call.get('type', 'call')
         is_import = api_call.get('is_import', False)
-
         args_py = repr(api_call.get('args', []))
         kwargs_py = repr(api_call.get('kwargs', {}))
-
         script_content = r'''#!/usr/bin/env python3
 import sys
 import inspect
 import importlib
 
-def check_api(api_path: str, is_import: bool, api_type: str, args: list, kwargs: dict) -> tuple:
+def check_api(
+    api_path: str,
+    is_import: bool,
+    api_type: str,
+    args: list,
+    kwargs: dict
+) -> tuple:
     parts = api_path.split('.')
     if len(parts) < 1:
         return False, f"Invalid API path: {api_path}"
-
     obj = None
-    last_error = f"Could not import any base module for {api_path}"
-
-    # Try import from longest path to shortest path
+    last_err = f"Cannot import base module for {api_path}"
     for i in range(len(parts), 0, -1):
         mod_name = '.'.join(parts[:i])
         try:
             obj = importlib.import_module(mod_name)
-            
             attr_missing = False
             for attr in parts[i:]:
-                # Strip trailing '()' to support anonymous instantiation syntax parsing
                 clean_attr = attr.replace('()', '')
-                
                 if not hasattr(obj, clean_attr):
-                    last_error = f"Attribute '{clean_attr}' not found in {mod_name}"
+                    msg = f"Attr '{clean_attr}' not found"
+                    last_err = msg
                     attr_missing = True
                     break
                 obj = getattr(obj, clean_attr)
-                
-            # [核心修复 1]：如果属性不存在，不要直接报错退出，继续尝试更短的模块路径
             if attr_missing:
                 continue
-
-            # === If cross-library import or from_import check, success if target object can be resolved ===
             if is_import or api_type in ["import", "from_import"]:
                 return True, "Import successful"
-
-            # [核心修复 2]：如果我们需要一个可调用对象（call），但当前找到的是个模块（发生同名覆盖）
-            # 不要立刻宣判死刑，跳过当前结果，退一步寻找真实的 Callable 属性！
             if not callable(obj):
-                last_error = f"{api_path} resolved to {type(obj).__name__}, which is not callable"
+                msg = f"{api_path} is not callable"
+                last_err = msg
                 continue
-
-            # 完美命中！既存在又 Callable，跳出查找循环
             break
-
         except ModuleNotFoundError as e:
-            if e.name and (mod_name == e.name or mod_name.startswith(e.name + '.')):
+            if e.name and (
+                mod_name == e.name or
+                mod_name.startswith(e.name + '.')
+            ):
                 continue
-            # Missing underlying dependency, raise upward
             raise e
-
-    # 如果所有组合都试过了还是不行，再抛出最终错误
-    if obj is None or (not is_import and api_type not in ["import", "from_import"] and not callable(obj)):
-        return False, last_error
-
+    if obj is None or (
+        not is_import and
+        api_type not in ["import", "from_import"] and
+        not callable(obj)
+    ):
+        return False, last_err
+    if not args and isinstance(kwargs, dict):
+        if 'args' in kwargs and 'kwargs' in kwargs:
+            r_args = kwargs['args']
+            r_kwargs = kwargs['kwargs']
+            if isinstance(r_args, (list, tuple)):
+                if isinstance(r_kwargs, dict):
+                    args = r_args
+                    kwargs = r_kwargs
+    static_failed = False
     try:
         sig = inspect.signature(obj)
-    except (ValueError, TypeError) as e:
-        return True, f"Cannot inspect signature (assumed compatible): {e}"
-
-    try:
-        # ==============================================================
-        # Intelligently unwrap wrapper layer parameters
-        # ==============================================================
-        if not args and isinstance(kwargs, dict) and 'args' in kwargs and 'kwargs' in kwargs:
-            real_args = kwargs['args']
-            real_kwargs = kwargs['kwargs']
-            
-            if isinstance(real_args, (list, tuple)) and isinstance(real_kwargs, dict):
-                args = real_args
-                kwargs = real_kwargs
-        
-        # Binding test
-        sig.bind_partial(*args, **kwargs)
-        return True, "API signature matches perfectly"
-        
-    except TypeError as e:
-        # ==============================================================
-        # Core fix: Handle Positional-Only parameters
-        # ==============================================================
-        if "positional only" in str(e):
-            bound_args = list(args)
-            remaining_kwargs = kwargs.copy()
-            
-            for name, param in sig.parameters.items():
-                if param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
-                    if name in remaining_kwargs:
-                        bound_args.append(remaining_kwargs.pop(name))
-            try:
-                sig.bind_partial(*bound_args, **remaining_kwargs)
-                return True, "API signature matches (Auto-adjusted for positional-only)"
-            except TypeError as e2:
-                return False, f"Signature mismatch: {str(e2)}"
-                
-        return False, f"Signature mismatch: {str(e)}"
+        try:
+            sig.bind_partial(*args, **kwargs)
+            return True, "Static signature matched"
+        except TypeError as e:
+            if "positional only" in str(e):
+                b_args = list(args)
+                r_kws = kwargs.copy()
+                for name, param in sig.parameters.items():
+                    is_pos = param.kind in (
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD
+                    )
+                    if is_pos and name in r_kws:
+                        b_args.append(r_kws.pop(name))
+                try:
+                    sig.bind_partial(*b_args, **r_kws)
+                    return True, "Static matched (adj)"
+                except TypeError:
+                    static_failed = True
+            else:
+                static_failed = True
+    except (ValueError, TypeError):
+        static_failed = True
+    if static_failed:
+        try:
+            obj(*args, **kwargs)
+            return True, "Dynamic execution succeeded"
+        except TypeError as e:
+            err_msg = str(e).lower()
+            signature_errors = [
+                "unexpected keyword argument",
+                "positional argument",
+                "required positional argument",
+                "missing",
+                "takes",
+                "multiple values for argument"
+            ]
+            if any(err in err_msg for err in signature_errors):
+                return False, f"Signature mismatch: {str(e)}"
+            return True, f"Exec err but sig ok: {str(e)}"
+        except Exception as e:
+            return True, f"Exec err but sig ok: {str(e)}"
 
 def main():
     api_path = <<<CALLEE>>>
@@ -1149,18 +1151,19 @@ def main():
     api_type = <<<API_TYPE>>>
     args = <<<ARGS>>>
     kwargs = <<<KWARGS>>>
-
     try:
-        compatible, message = check_api(api_path, is_import, api_type, args, kwargs)
-        if compatible:
-            print(f"✓ compatible: {message}")
+        ok, msg = check_api(
+            api_path, is_import, api_type, args, kwargs
+        )
+        if ok:
+            print(f"✓ compatible: {msg}")
             sys.exit(0)
         else:
-            print(f"✗ incompatible: {message}")
+            print(f"✗ incompatible: {msg}")
             sys.exit(1)
-
     except ModuleNotFoundError as e:
-        sys.stderr.write(f"ModuleNotFoundError: No module named '{e.name}'\n")
+        err = f"ModuleNotFoundError: No module named '{e.name}'\n"
+        sys.stderr.write(err)
         sys.exit(2)
     except Exception as e:
         sys.stderr.write(f"Runtime error: {str(e)}\n")
@@ -1169,7 +1172,6 @@ def main():
 if __name__ == "__main__":
     main()
 '''
-        # Use chained replacement to safely inject variables
         return script_content.replace(
             "<<<CALLEE>>>", repr(callee)
         ).replace(
