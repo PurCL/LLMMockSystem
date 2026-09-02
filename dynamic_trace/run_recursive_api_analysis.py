@@ -105,7 +105,7 @@ class RecursiveAPIAnalyzer:
                 capture_output=True,
                 text=True,
                 cwd=str(cwd) if cwd else None,
-                timeout=1800  # 30 minutes timeout
+                timeout=36000  # 30 minutes timeout
             )
 
             if result.stdout:
@@ -468,7 +468,7 @@ Description:
             capture_output=True,
             text=True,
             cwd=str(Path(__file__).parent.absolute()),
-            timeout=1800
+            timeout=36000
         )
 
         if result.stdout:

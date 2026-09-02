@@ -1797,7 +1797,7 @@ def main():
     parser.add_argument(
         '--limit',
         type=int,
-        default=10,
+        default=1000,
         help='Limit the number of versions to test (for testing purposes)'
     )
     parser.add_argument(
