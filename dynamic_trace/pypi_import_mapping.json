@@ -249,5 +249,6 @@
   "langchain-core": "langchain_core",
   "Flask-HTTPAuth": "flask_httpauth",
   "kedro-datasets": "kedro_datasets",
-  "apache-airflow": "airflow"
+  "apache-airflow": "airflow",
+  "dm-tree": "tree"
 }
