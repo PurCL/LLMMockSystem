@@ -43,6 +43,10 @@ class RecursiveAPIAnalyzer:
         # Track processed directories to avoid infinite loops
         self.processed_dirs = set()
 
+        # Track execution times
+        self.extract_time = 0
+        self.verify_time = 0
+
         # Load PyPI import mapping
         self.pypi_import_mapping = self._load_pypi_import_mapping(
             str(self.base_dir / "pypi_import_mapping.json")
@@ -153,6 +157,13 @@ class RecursiveAPIAnalyzer:
             print("❌ Failed to extract library calls")
             return False
 
+        # Extract execution time from stdout
+        import re
+        match = re.search(r'EXTRACT_EXECUTION_TIME:([\d.]+)', stdout)
+        if match:
+            self.extract_time = float(match.group(1))
+            print(f"✓ Extract execution time: {self.extract_time:.2f}s")
+
         print("✓ Successfully extracted library calls")
         return True
 
@@ -194,6 +205,14 @@ class RecursiveAPIAnalyzer:
         if not success:
             print(f"❌ Failed to verify compatibility for {package_name}")
             return False, None
+
+        # Extract execution time from stdout
+        import re
+        match = re.search(r'VERIFY_EXECUTION_TIME:([\d.]+)', stdout)
+        if match:
+            exec_time = float(match.group(1))
+            self.verify_time += exec_time
+            print(f"✓ Verify execution time for {package_name}: {exec_time:.2f}s")
 
         # Find the generated compatibility JSON
         compatibility_json = api_file.parent / f"{package_name}_compatibility_results.json"
@@ -429,9 +448,6 @@ Description:
             print(f"❌ Error: Failed to read vulnerable file: {e}")
             sys.exit(1)
 
-    # Start timing
-    start_time = time.time()
-
     # Create analyzer and run
     analyzer = RecursiveAPIAnalyzer(
         args.script_path,
@@ -486,8 +502,8 @@ Description:
         print(f"\n❌ Error running extract_version_compatibility.py: {e}")
         sys.exit(1)
 
-    # Record elapsed time
-    elapsed_time = time.time() - start_time
+    # Calculate total execution time (excluding pip install)
+    total_execution_time = analyzer.extract_time + analyzer.verify_time
 
     # Save statistics
     statistics_output = f"{args.CVE}-statistics.json"
@@ -495,65 +511,69 @@ Description:
         "CVE": args.CVE,
         "script_path": str(args.script_path),
         "api_log_dir": str(analyzer.api_log_dir),
-        "elapsed_time_seconds": elapsed_time,
-        "elapsed_time_formatted": f"{elapsed_time:.2f}s"
+        "extract_time_seconds": analyzer.extract_time,
+        "verify_time_seconds": analyzer.verify_time,
+        "total_execution_time_seconds": total_execution_time,
+        "elapsed_time_formatted": f"{total_execution_time:.2f}s"
     }
 
     try:
         with open(statistics_output, 'w', encoding='utf-8') as f:
             json.dump(statistics, f, indent=2, ensure_ascii=False)
         print(f"\n✓ Statistics saved to {statistics_output}")
-        print(f"Total elapsed time: {elapsed_time:.2f} seconds")
+        print(f"Extract time (excluding pip install): {analyzer.extract_time:.2f} seconds")
+        print(f"Verify time (excluding pip install): {analyzer.verify_time:.2f} seconds")
+        print(f"Total execution time (excluding pip install): {total_execution_time:.2f} seconds")
     except Exception as e:
         print(f"\n⚠️ Warning: Failed to save statistics: {e}")
 
     # Run end_to_end_verify_version_combinations.py
-    print(f"\n{'#'*80}")
-    print("Running end_to_end_verify_version_combinations.py")
-    print(f"{'#'*80}")
+    # print(f"\n{'#'*80}")
+    # print("Running end_to_end_verify_version_combinations.py")
+    # print(f"{'#'*80}")
 
-    exploit_test_output = f"{args.CVE}-exploit_test_results.json"
-    verify_cmd = [
-        'python3',
-        'end_to_end_verify_version_combinations.py',
-        args.script_path,
-        compatibility_output,
-        '-n', '10',
-        '-o', exploit_test_output
-    ]
+    # exploit_test_output = f"{args.CVE}-exploit_test_results.json"
+    # verify_cmd = [
+    #     'python3',
+    #     'end_to_end_verify_version_combinations.py',
+    #     args.script_path,
+    #     compatibility_output,
+    #     '-n', '10',
+    #     '-o', exploit_test_output
+    # ]
 
-    print(f"Command: {' '.join(verify_cmd)}")
-    try:
-        result = subprocess.run(
-            verify_cmd,
-            capture_output=True,
-            text=True,
-            cwd=str(Path(__file__).parent.absolute()),
-            timeout=3600  # 1 hour timeout for testing
-        )
+    # print(f"Command: {' '.join(verify_cmd)}")
+    # try:
+    #     result = subprocess.run(
+    #         verify_cmd,
+    #         capture_output=True,
+    #         text=True,
+    #         cwd=str(Path(__file__).parent.absolute()),
+    #         timeout=3600  # 1 hour timeout for testing
+    #     )
 
-        if result.stdout:
-            print(result.stdout)
-        if result.stderr:
-            print("STDERR:", result.stderr, file=sys.stderr)
+    #     if result.stdout:
+    #         print(result.stdout)
+    #     if result.stderr:
+    #         print("STDERR:", result.stderr, file=sys.stderr)
 
-        if result.returncode != 0:
-            print(f"\n❌ end_to_end_verify_version_combinations.py failed with return code {result.returncode}")
-            sys.exit(1)
+    #     if result.returncode != 0:
+    #         print(f"\n❌ end_to_end_verify_version_combinations.py failed with return code {result.returncode}")
+    #         sys.exit(1)
 
-        print(f"✓ Successfully generated {exploit_test_output}")
+    #     print(f"✓ Successfully generated {exploit_test_output}")
 
-    except Exception as e:
-        print(f"\n❌ Error running end_to_end_verify_version_combinations.py: {e}")
-        sys.exit(1)
+    # except Exception as e:
+    #     print(f"\n❌ Error running end_to_end_verify_version_combinations.py: {e}")
+    #     sys.exit(1)
 
-    print(f"\n{'#'*80}")
-    print("ALL STEPS COMPLETED SUCCESSFULLY!")
-    print(f"{'#'*80}")
-    print(f"Generated files:")
-    print(f"  - {compatibility_output}")
-    print(f"  - {statistics_output}")
-    print(f"  - {exploit_test_output}")
+    # print(f"\n{'#'*80}")
+    # print("ALL STEPS COMPLETED SUCCESSFULLY!")
+    # print(f"{'#'*80}")
+    # print(f"Generated files:")
+    # print(f"  - {compatibility_output}")
+    # print(f"  - {statistics_output}")
+    # print(f"  - {exploit_test_output}")
 
     sys.exit(0)
 

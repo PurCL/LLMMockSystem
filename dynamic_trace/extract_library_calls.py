@@ -40,6 +40,9 @@ class LibraryCallExtractor:
         # Load PyPI import mapping from JSON file
         self.module_to_package = self._load_pypi_import_mapping()
 
+        # Track execution time
+        self.execution_time = 0
+
     def _setup_venv(self, work_dir: str, venv_name: str = '.venv') -> Tuple[bool, str]:
         """Create isolated virtual environment"""
         try:
@@ -145,7 +148,7 @@ class LibraryCallExtractor:
                 content = f.read()
 
             python_blocks = []
-            pattern1 = r"cat\s+>\s+(\S+\.py)\s+<<\s*'?(\w+)'?\s*\n(.*?)\n\2"
+            pattern1 = r"cat\s+>\s+['\"]?([^'\"]+\.py)['\"]?\s+<<\s*'?(\w+)'?\s*\n(.*?)\n\2"
             for match in re.finditer(pattern1, content, re.DOTALL):
                 filename, delimiter, code = match.groups()
                 python_blocks.append((filename, code))
@@ -267,9 +270,14 @@ class LibraryCallExtractor:
         print(f"Extracting Library Calls from: {self.script_path}")
         print(f"{'='*60}\n")
 
+        # Start timing (excluding pip install)
+        start_time = time.time()
+
         python_blocks = self._extract_script_content(self.script_path)
         work_dir = tempfile.mkdtemp(prefix="extract_api_calls_")
         venv_path = os.path.join(work_dir, '.venv')
+
+        pip_install_time = 0
 
         try:
             print("  Creating virtual environment...")
@@ -280,7 +288,9 @@ class LibraryCallExtractor:
             print("  ✓ Virtual environment created")
 
             print(f"  Installing requirements from: {self.requirements}")
+            pip_start = time.time()
             success, error = self._install_requirements(str(self.requirements), venv_path)
+            pip_install_time += time.time() - pip_start
             if not success:
                 print(f"  ✗ Failed to install requirements: {error}")
                 return
@@ -303,6 +313,14 @@ class LibraryCallExtractor:
         total_calls = sum(len(calls) for lib_calls in self.library_calls.values()
                          for calls in lib_calls.values())
         print(f"\nExtracted {total_calls} library calls from {len(self.library_calls)} libraries")
+
+        # Calculate elapsed time excluding pip install
+        total_elapsed = time.time() - start_time
+        execution_time = total_elapsed - pip_install_time
+        self.execution_time = execution_time
+        print(f"\n{'='*60}")
+        print(f"Execution time (excluding pip install): {execution_time:.2f} seconds")
+        print(f"{'='*60}")
 
     def save_api_logs(self):
         """Save API calls for each library to separate Python scripts with deduplication"""
@@ -378,7 +396,11 @@ def main():
     print(f"\n{'='*60}")
     print("Library Call Extraction Complete!")
     print(f"API logs saved to: {api_log_dir}")
+    print(f"Execution time (excluding pip install): {extractor.execution_time:.2f} seconds")
     print(f"{'='*60}")
+
+    # Output execution time for parent process to capture
+    print(f"EXTRACT_EXECUTION_TIME:{extractor.execution_time:.2f}")
 
 
 if __name__ == "__main__":

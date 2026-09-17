@@ -750,6 +750,7 @@ class VersionWorker:
         pypi_import_mapping: Dict[str, str]
     ):
         self.venv_manager = VenvManager(pypi_import_mapping)
+        self.pip_install_time = 0
 
     def process_single_version(self, args: Tuple) -> Dict:
         """
@@ -780,6 +781,7 @@ class VersionWorker:
             'unsupported_api_ids': dict(),
             'compatible_upstream_versions': [],
             'incompatible_upstream_versions': [],
+            'pip_install_time': 0,
         }
 
         print(f"\n[Worker {version_index}] {'='*60}")
@@ -812,11 +814,13 @@ class VersionWorker:
             # Step 3: Install package
             venv_path = os.path.join(version_dir, venv_name)
             print(f"[Worker {version_index}] Step 3: Installing {package_name}=={version}...")
+            pip_start = time.time()
             success, error = self.venv_manager.install_package(
                 package_name=package_name,
                 venv_path=venv_path,
                 version=version
             )
+            self.pip_install_time += time.time() - pip_start
             if not success:
                 result['error_message'] = f"Installation failed: {error}"
                 print(f"[Worker {version_index}] ✗ {result['error_message']}")
@@ -873,10 +877,12 @@ class VersionWorker:
 
                         print(f"  [Worker {version_index}] Auto-installing: {missing_pkg} (Attempt {attempt+1}/{max_retries})...")
 
+                        pip_start = time.time()
                         install_success, error_msg = self.venv_manager.install_package(
                             package_name=missing_pkg,
                             venv_path=venv_path,
                         )
+                        self.pip_install_time += time.time() - pip_start
 
                         if install_success:
                             current_package_name_version = self.venv_manager.get_package_version(
@@ -884,11 +890,13 @@ class VersionWorker:
                                 venv_path=venv_path
                             )
                             if not current_package_name_version == version:
+                                pip_start = time.time()
                                 install_success, error_msg = self.venv_manager.install_package(
                                     package_name=package_name,
                                     venv_path=venv_path,
                                     version=version
                                 )
+                                self.pip_install_time += time.time() - pip_start
                                 if not install_success:
                                     err_brief = error_msg.strip().split('\n')[-1][:150]
                                     failed_api_ids[api_id] = f"✗ Failed to re-install {package_name}=={version} after installing {missing_pkg}: {err_brief}"
@@ -1011,12 +1019,15 @@ class VersionWorker:
                             "status": err_brief
                         }
 
+            # Record pip install time in result
+            result['pip_install_time'] = self.pip_install_time
             return result
 
         except Exception as e:
             print(f"[Worker {version_index}] ✗ Unexpected error: {e}")
             traceback.print_exc()
             result['error_message'] = f"Unexpected error: {str(e)}"
+            result['pip_install_time'] = self.pip_install_time
             return result
 
         finally:
@@ -1302,6 +1313,10 @@ class CompatibilityTester:
         # Store optional versions parameter
         self.versions = versions
 
+        # Track execution time (excluding pip install)
+        self.execution_time = 0
+        self.pip_install_time = 0
+
     def run(
         self,
         apis_file_path: str,
@@ -1319,6 +1334,9 @@ class CompatibilityTester:
         print(f"{'='*60}")
         print(f"Package Version Compatibility Tester")
         print(f"{'='*60}\n")
+
+        # Start timing
+        start_time = time.time()
 
         # Step 1: Parse API file
         print(f"Step 1: Parsing APIs file: {apis_file_path}")
@@ -1459,12 +1477,29 @@ class CompatibilityTester:
 
         print(f"  ✓ Processed a total of {len(results)} valid results.\n")
 
+        # Calculate timing (wall clock time only - pip time is included in parallel execution)
+        total_elapsed = time.time() - start_time
+
+        # For parallel execution, we track max pip install time as a reference (not for subtraction)
+        max_pip_install_time = max((r.get('pip_install_time', 0) for r in results if isinstance(r, dict)), default=0)
+
+        self.execution_time = total_elapsed - max_pip_install_time
+        self.pip_install_time = max_pip_install_time
+
         # Step 4: Save results
         print(f"Step 4: Saving results...")
 
         version_mapping_file = os.path.join(apis_dir, f"{package_name}_version_mapping.json")
 
         self.save_results(package_name, results, apis_dir, version_mapping_file)
+
+        # Print timing information
+        print(f"\n{'='*60}")
+        print(f"Timing Summary:")
+        print(f"  Total elapsed time (wall clock): {total_elapsed:.2f}s")
+        print(f"  Longest pip install time: {max_pip_install_time:.2f}s")
+        print(f"  Note: Pip installs run in parallel, so they overlap with total time")
+        print(f"{'='*60}")
 
     @staticmethod
     def _load_pypi_import_mapping(mapping_file: str) -> Dict[str, str]:
@@ -1797,7 +1832,7 @@ def main():
     parser.add_argument(
         '--limit',
         type=int,
-        default=1000,
+        default=10,
         help='Limit the number of versions to test (for testing purposes)'
     )
     parser.add_argument(
@@ -1833,6 +1868,8 @@ def main():
             output_file=args.output,
             limit=args.limit
         )
+        # Output execution time for parent process to capture (total wall clock time)
+        print(f"VERIFY_EXECUTION_TIME:{tester.execution_time:.2f}")
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         traceback.print_exc()
