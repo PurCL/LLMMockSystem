@@ -1,0 +1,151 @@
+{% extends "base.html" %}
+
+{% block title %}{{ cve_id }} - CVE Details{% endblock %}
+
+{% block navigation %}
+<div class="nav">
+    <a href="/">← Back to Home</a> | <span style="color: #495057;">{{ cve_id }}</span>
+</div>
+{% endblock %}
+
+{% block content %}
+<!-- Header section: Flex layout with Title on the left and a Badges Container on the right -->
+<div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 20px;">
+    <h2 style="color: #667eea; margin: 0; font-size: 2em; padding-top: 10px;">
+        🛡️ {{ cve_id }}
+    </h2>
+    
+    <!-- Badges Container: Aligns multiple badges horizontally -->
+    <div style="display: flex; gap: 15px; align-items: flex-start;">
+        
+        <!-- Execution Time Badge -->
+        <div id="timeBadge" style="display: none; background: #f8f9fa; border: 1px solid #e2e8f0; padding: 10px 20px; border-radius: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.02); text-align: center;">
+            <div style="font-size: 1.1em; color: #4a5568; font-weight: 500;">
+                ⏱️ Execution Time: 
+                <strong id="execTime" style="color: #48bb78; font-size: 1.3em; margin-left: 5px;">...</strong>
+            </div>
+        </div>
+
+        <!-- Combinations Badge -->
+        <div id="combinationsBadge" style="display: none; background: #f8f9fa; border: 1px solid #e2e8f0; padding: 10px 20px; border-radius: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.02); text-align: right;">
+            <div style="font-size: 1.1em; color: #4a5568; font-weight: 500;">
+                🔢 Total Combinations: 
+                <strong id="comboCount" style="color: #667eea; font-size: 1.3em; margin-left: 5px;">...</strong>
+            </div>
+            <div style="font-size: 0.8em; color: #a0aec0; margin-top: 4px; font-style: italic;">
+                (Top 10 latest versions for each package)
+            </div>
+        </div>
+        
+    </div>
+</div>
+
+<!-- Main layout: Use Flexbox for left and right columns -->
+<div style="display: flex; gap: 20px; height: calc(100vh - 180px); min-height: 600px;">
+    
+    <!-- Left Column: Dependency Tree Display -->
+    <div style="flex: 1; background: white; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); display: flex; flex-direction: column; overflow: hidden;">
+        <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 15px 20px;">
+            <h3 style="margin: 0; font-size: 1.2em;">📄 Dependency Tree</h3>
+        </div>
+        <div style="padding: 20px; overflow-y: auto; flex: 1; background: #f8f9fa;">
+            <div id="compatibilityContent" class="loading">Loading compatibility data...</div>
+        </div>
+    </div>
+
+    <!-- Right Column: Dependency Tree HTML Embed -->
+    <div style="flex: 1; background: white; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); display: flex; flex-direction: column; overflow: hidden;">
+        <div style="background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%); color: #2d3748; padding: 15px 20px;">
+            <h3 style="margin: 0; font-size: 1.2em;">🌳 Dependency Tree Visualizer</h3>
+        </div>
+        <div style="flex: 1; position: relative;">
+            <!-- Embed the dependency tree HTML page using an iframe -->
+            <iframe 
+                id="treeFrame" 
+                src="/api/cve/{{ cve_id }}/file/{{ cve_id }}-dependency-tree.html" 
+                style="width: 100%; height: 100%; border: none;"
+                title="Dependency Tree">
+            </iframe>
+        </div>
+    </div>
+    
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const cveId = '{{ cve_id }}';
+        
+        // 1. Fetch and render compatibility.json data
+        const contentDiv = document.getElementById('compatibilityContent');
+        const jsonFileName = `${cveId}-compatibility.json`;
+
+        fetch(`/api/cve/${cveId}/file/${jsonFileName}`)
+            .then(response => {
+                if (!response.ok) throw new Error('File not found');
+                return response.json();
+            })
+            .then(data => {
+                if (data.error) {
+                    contentDiv.innerHTML = `<div style="color: #dc3545;"><strong>Error:</strong> ${data.error}</div>`;
+                } else {
+                    const formatted = JSON.stringify(data, null, 2);
+                    contentDiv.innerHTML = `<pre class="json-viewer" style="margin: 0; font-family: 'Courier New', monospace; font-size: 0.9em; color: #333;">${escapeHtml(formatted)}</pre>`;
+                }
+            })
+            .catch(error => {
+                contentDiv.innerHTML = `<div style="color: #dc3545;"><strong>Failed to load ${jsonFileName}:</strong> ${error.message}</div>`;
+            });
+
+        // 2. Fetch and render combinations.json data
+        const comboBadge = document.getElementById('combinationsBadge');
+        const comboSpan = document.getElementById('comboCount');
+        const comboFileName = `${cveId}-combinations.json`;
+
+        fetch(`/api/cve/${cveId}/file/${comboFileName}`)
+            .then(response => {
+                if (!response.ok) throw new Error('Combinations file not found');
+                return response.json();
+            })
+            .then(data => {
+                comboBadge.style.display = 'block';
+                let countValue = data.total_combinations !== undefined ? data.total_combinations : (Object.values(data)[0] || data);
+                comboSpan.textContent = Number(countValue).toLocaleString();
+            })
+            .catch(error => console.warn(`Could not load ${comboFileName}:`, error));
+
+        // 3. Fetch and render statistics.json data (Execution Time)
+        const timeBadge = document.getElementById('timeBadge');
+        const timeSpan = document.getElementById('execTime');
+        const statsFileName = `${cveId}-statistics.json`;
+
+        fetch(`/api/cve/${cveId}/file/${statsFileName}`)
+            .then(response => {
+                if (!response.ok) throw new Error('Statistics file not found');
+                return response.json();
+            })
+            .then(data => {
+                // Check if elapsed_time_formatted exists in the JSON
+                if (data.elapsed_time_formatted) {
+                    timeBadge.style.display = 'block';
+                    timeSpan.textContent = data.elapsed_time_formatted;
+                }
+            })
+            .catch(error => console.warn(`Could not load ${statsFileName}:`, error));
+    });
+
+    // Helper function: Prevent XSS injection
+    function escapeHtml(text) {
+        const map = {
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            '"': '&quot;',
+            "'": '&#039;'
+        };
+        return text.replace(/[&<>"']/g, m => map[m]);
+    }
+</script>
+{% endblock %}

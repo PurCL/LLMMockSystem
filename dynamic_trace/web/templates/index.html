@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+
+{% block title %}CVE Results - Home{% endblock %}
+
+{% block navigation %}
+<div class="nav">
+    <a href="/">🏠 Home</a>
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="stats">
+    <div class="stat-card">
+        <h3>Total CVEs</h3>
+        <div class="number">{{ total }}</div>
+    </div>
+    <!-- <div class="stat-card">
+        <h3>Results Directory</h3>
+        <div style="font-size: 0.9em; margin-top: 10px;">
+            /home/jian1000/data3/LLMMockSystem/dynamic_trace/results
+        </div>
+    </div> -->
+</div>
+
+<div class="search-box">
+    <input type="text" id="searchInput" placeholder="🔍 Search CVE ID...">
+</div>
+
+<div class="cve-grid" id="cveGrid">
+    {% for cve in cves %}
+    <div class="cve-card" data-cve="{{ cve }}" onclick="window.location.href='/cve/{{ cve }}'">
+        <h3>{{ cve }}</h3>
+        <div class="info">
+            Click to view details →
+        </div>
+    </div>
+    {% endfor %}
+</div>
+
+{% if total == 0 %}
+<div style="text-align: center; padding: 60px; color: #6c757d;">
+    <h2>📭 No CVE data available</h2>
+    <p style="margin-top: 15px;">No CVE data found in results directory</p>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+    const searchInput = document.getElementById('searchInput');
+    const cveCards = document.querySelectorAll('.cve-card');
+
+    searchInput.addEventListener('input', function() {
+        const searchTerm = this.value.toLowerCase();
+
+        cveCards.forEach(card => {
+            const cveId = card.dataset.cve.toLowerCase();
+            if (cveId.includes(searchTerm)) {
+                card.style.display = 'block';
+            } else {
+                card.style.display = 'none';
+            }
+        });
+    });
+
+    document.addEventListener('keydown', function(e) {
+        if (e.key === '/' && e.target !== searchInput) {
+            e.preventDefault();
+            searchInput.focus();
+        }
+    });
+
+    console.log('%c🛡️ CVE Results Viewer', 'font-size: 20px; color: #667eea; font-weight: bold;');
+    console.log(`Total CVEs: ${cveCards.length}`);
+</script>
+{% endblock %}

@@ -528,52 +528,112 @@ Description:
         print(f"\n⚠️ Warning: Failed to save statistics: {e}")
 
     # Run end_to_end_verify_version_combinations.py
-    # print(f"\n{'#'*80}")
-    # print("Running end_to_end_verify_version_combinations.py")
-    # print(f"{'#'*80}")
+    print(f"\n{'#'*80}")
+    print("Running end_to_end_verify_version_combinations.py")
+    print(f"{'#'*80}")
 
-    # exploit_test_output = f"{args.CVE}-exploit_test_results.json"
-    # verify_cmd = [
-    #     'python3',
-    #     'end_to_end_verify_version_combinations.py',
-    #     args.script_path,
-    #     compatibility_output,
-    #     '-n', '10',
-    #     '-o', exploit_test_output
-    # ]
+    exploit_test_output = f"{args.CVE}-exploit_test_results.json"
+    verify_cmd = [
+        'python3',
+        'end_to_end_verify_version_combinations.py',
+        args.script_path,
+        compatibility_output,
+        '-n', '10',
+        '-o', exploit_test_output
+    ]
 
-    # print(f"Command: {' '.join(verify_cmd)}")
-    # try:
-    #     result = subprocess.run(
-    #         verify_cmd,
-    #         capture_output=True,
-    #         text=True,
-    #         cwd=str(Path(__file__).parent.absolute()),
-    #         timeout=3600  # 1 hour timeout for testing
-    #     )
+    print(f"Command: {' '.join(verify_cmd)}")
+    try:
+        result = subprocess.run(
+            verify_cmd,
+            capture_output=True,
+            text=True,
+            cwd=str(Path(__file__).parent.absolute()),
+            timeout=3600  # 1 hour timeout for testing
+        )
 
-    #     if result.stdout:
-    #         print(result.stdout)
-    #     if result.stderr:
-    #         print("STDERR:", result.stderr, file=sys.stderr)
+        if result.stdout:
+            print(result.stdout)
+        if result.stderr:
+            print("STDERR:", result.stderr, file=sys.stderr)
 
-    #     if result.returncode != 0:
-    #         print(f"\n❌ end_to_end_verify_version_combinations.py failed with return code {result.returncode}")
-    #         sys.exit(1)
+        if result.returncode != 0:
+            print(f"\n❌ end_to_end_verify_version_combinations.py failed with return code {result.returncode}")
+            sys.exit(1)
 
-    #     print(f"✓ Successfully generated {exploit_test_output}")
+        print(f"✓ Successfully generated {exploit_test_output}")
 
-    # except Exception as e:
-    #     print(f"\n❌ Error running end_to_end_verify_version_combinations.py: {e}")
-    #     sys.exit(1)
+    except Exception as e:
+        print(f"\n❌ Error running end_to_end_verify_version_combinations.py: {e}")
+        sys.exit(1)
 
-    # print(f"\n{'#'*80}")
-    # print("ALL STEPS COMPLETED SUCCESSFULLY!")
-    # print(f"{'#'*80}")
-    # print(f"Generated files:")
-    # print(f"  - {compatibility_output}")
-    # print(f"  - {statistics_output}")
-    # print(f"  - {exploit_test_output}")
+    # =========================================================================
+    # Run visualize.py to generate dependency tree HTML
+    # =========================================================================
+    print(f"\n{'#'*80}")
+    print("Running visualize.py (Generating Interactive Tree HTML)")
+    print(f"{'#'*80}")
+
+    tree_html_output = f"{args.CVE}-dependency-tree.html"
+    visualize_cmd = [
+        'python3',
+        'visualize.py',  # Ensure this matches your script name (visualize.py or visualize_tree.py)
+        compatibility_output,
+        tree_html_output
+    ]
+
+    print(f"Command: {' '.join(visualize_cmd)}")
+    try:
+        result = subprocess.run(visualize_cmd, capture_output=True, text=True, cwd=str(Path(__file__).parent.absolute()))
+        if result.stdout:
+            print(result.stdout)
+        if result.stderr:
+            print("STDERR:", result.stderr, file=sys.stderr)
+        if result.returncode != 0:
+            print(f"\n⚠️ visualize.py failed with return code {result.returncode}")
+        else:
+            print(f"✓ Successfully generated {tree_html_output}")
+    except Exception as e:
+        print(f"\n⚠️ Error running visualize.py: {e}")
+
+    # =========================================================================
+    # Run calc_combinations.py to calculate combination statistics
+    # =========================================================================
+    print(f"\n{'#'*80}")
+    print("Running calc_combinations.py (Calculating Combination Statistics)")
+    print(f"{'#'*80}")
+
+    combinations_output = f"{args.CVE}-combinations.json"
+    calc_cmd = [
+        'python3',
+        'calc_combinations.py',
+        compatibility_output,
+        combinations_output
+    ]
+
+    print(f"Command: {' '.join(calc_cmd)}")
+    try:
+        result = subprocess.run(calc_cmd, capture_output=True, text=True, cwd=str(Path(__file__).parent.absolute()))
+        if result.stdout:
+            print(result.stdout)
+        if result.stderr:
+            print("STDERR:", result.stderr, file=sys.stderr)
+        if result.returncode != 0:
+            print(f"\n⚠️ calc_combinations.py failed with return code {result.returncode}")
+        else:
+            print(f"✓ Successfully generated {combinations_output}")
+    except Exception as e:
+        print(f"\n⚠️ Error running calc_combinations.py: {e}")
+
+    print(f"\n{'#'*80}")
+    print("ALL STEPS COMPLETED SUCCESSFULLY!")
+    print(f"{'#'*80}")
+    print(f"Generated files:")
+    print(f"  - {compatibility_output}")
+    print(f"  - {statistics_output}")
+    print(f"  - {exploit_test_output}")
+    print(f"  - {tree_html_output}")
+    print(f"  - {combinations_output}")
 
     sys.exit(0)
 
