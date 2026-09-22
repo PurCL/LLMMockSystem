@@ -9,20 +9,59 @@
 {% endblock %}
 
 {% block content %}
-<!-- Header section: Flex layout with Title on the left and a Badges Container on the right -->
+<!-- CSS for the inline spinner and button transitions -->
+<style>
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    .spinner-icon {
+        border: 3px solid rgba(255,255,255,0.3);
+        border-radius: 50%;
+        border-top: 3px solid white;
+        width: 16px;
+        height: 16px;
+        animation: spin 1s linear infinite;
+        display: inline-block;
+    }
+    .run-btn {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white; border: none; padding: 10px 24px; border-radius: 8px;
+        font-size: 1.05em; font-weight: 600; cursor: pointer;
+        display: flex; align-items: center; justify-content: center; gap: 8px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1); transition: all 0.2s;
+        min-width: 170px; /* Fix width to prevent jitter when text changes */
+    }
+    .run-btn:not(:disabled):hover { transform: translateY(-2px); box-shadow: 0 6px 12px rgba(102, 126, 234, 0.3); }
+    .run-btn:not(:disabled):active { transform: translateY(0); }
+    .run-btn:disabled { opacity: 0.8; cursor: not-allowed; background: #a0aec0; box-shadow: none; }
+</style>
+
+<!-- Header section: Flex layout -->
 <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 20px;">
-    <h2 style="color: #667eea; margin: 0; font-size: 2em; padding-top: 10px;">
-        🛡️ {{ cve_id }}
-    </h2>
     
-    <!-- Badges Container: Aligns multiple badges horizontally -->
-    <div style="display: flex; gap: 15px; align-items: flex-start;">
+    <div style="display: flex; align-items: center; gap: 20px;">
+        <h2 style="color: #667eea; margin: 0; font-size: 2em; padding-top: 10px;">
+            🛡️ {{ cve_id }}
+        </h2>
         
+        <!-- Run Analysis Button Area -->
+        <div style="display: flex; flex-direction: column; gap: 6px; margin-top: 10px;">
+            <button id="runBtn" onclick="runAnalysis('{{ cve_id }}')" class="run-btn">
+                🚀 Run Analysis
+            </button>
+            <!-- Inline error message (hidden by default) -->
+            <span id="runError" style="color: #e53e3e; font-size: 0.85em; display: none; font-weight: 500;"></span>
+        </div>
+    </div>
+    
+    <!-- Badges Container -->
+    <div style="display: flex; gap: 15px; align-items: flex-start;">
         <!-- Execution Time Badge -->
         <div id="timeBadge" style="display: none; background: #f8f9fa; border: 1px solid #e2e8f0; padding: 10px 20px; border-radius: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.02); text-align: center;">
             <div style="font-size: 1.1em; color: #4a5568; font-weight: 500;">
                 ⏱️ Execution Time: 
                 <strong id="execTime" style="color: #48bb78; font-size: 1.3em; margin-left: 5px;">...</strong>
+            </div>
+            <div style="font-size: 0.8em; color: #a0aec0; margin-top: 4px; font-style: italic;">
+                (10 Processors)
             </div>
         </div>
 
@@ -36,20 +75,18 @@
                 (Top 10 latest versions for each package)
             </div>
         </div>
-        
     </div>
 </div>
 
 <!-- Main layout: Use Flexbox for left and right columns -->
 <div style="display: flex; gap: 20px; height: calc(100vh - 180px); min-height: 600px;">
-    
     <!-- Left Column: Dependency Tree Display -->
     <div style="flex: 1; background: white; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); display: flex; flex-direction: column; overflow: hidden;">
         <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 15px 20px;">
             <h3 style="margin: 0; font-size: 1.2em;">📄 Dependency Tree</h3>
         </div>
         <div style="padding: 20px; overflow-y: auto; flex: 1; background: #f8f9fa;">
-            <div id="compatibilityContent" class="loading">Loading compatibility data...</div>
+            <div id="compatibilityContent" class="loading">No compatibility data found. Click "Run Analysis" to generate.</div>
         </div>
     </div>
 
@@ -59,7 +96,6 @@
             <h3 style="margin: 0; font-size: 1.2em;">🌳 Dependency Tree Visualizer</h3>
         </div>
         <div style="flex: 1; position: relative;">
-            <!-- Embed the dependency tree HTML page using an iframe -->
             <iframe 
                 id="treeFrame" 
                 src="/api/cve/{{ cve_id }}/file/{{ cve_id }}-dependency-tree.html" 
@@ -68,83 +104,103 @@
             </iframe>
         </div>
     </div>
-    
 </div>
-
 {% endblock %}
 
 {% block scripts %}
 <script>
+    // ---------------------------------------------------------
+    // Execute Analysis Logic (Non-blocking UI)
+    // ---------------------------------------------------------
+    function runAnalysis(cveId) {
+        const btn = document.getElementById('runBtn');
+        const errorSpan = document.getElementById('runError');
+
+        // Update button to 'In Progress' state and disable it
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-icon"></span> In Progress...';
+        btn.style.background = '#a0aec0'; // Grayed out background
+        errorSpan.style.display = 'none';
+
+        // Trigger the backend API
+        fetch(`/api/cve/${cveId}/run_analysis`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        })
+        .then(response => response.json().then(data => ({status: response.status, body: data})))
+        .then(res => {
+            if (res.status === 200) {
+                // Success: Show success state briefly, then reload
+                btn.innerHTML = '✅ Success!';
+                btn.style.background = '#48bb78'; // Green background
+                setTimeout(() => window.location.reload(), 1000);
+            } else {
+                // Error: Re-enable button and show inline error message
+                btn.disabled = false;
+                btn.innerHTML = '🚀 Run Analysis';
+                btn.style.background = ''; // Reset to original gradient
+                
+                // Show detailed error in the inline span
+                errorSpan.textContent = '❌ Failed: Check terminal or console';
+                errorSpan.style.display = 'block';
+                console.error("Analysis Failed:", res.body.error);
+            }
+        })
+        .catch(error => {
+            // Network Error: Re-enable button and show inline error
+            btn.disabled = false;
+            btn.innerHTML = '🚀 Run Analysis';
+            btn.style.background = '';
+            
+            errorSpan.textContent = '❌ Network Error';
+            errorSpan.style.display = 'block';
+            console.error("Network Error:", error);
+        });
+    }
+
+    // ---------------------------------------------------------
+    // Fetch Data on Page Load
+    // ---------------------------------------------------------
     document.addEventListener('DOMContentLoaded', function() {
         const cveId = '{{ cve_id }}';
         
-        // 1. Fetch and render compatibility.json data
+        // 1. Fetch and render compatibility.json
         const contentDiv = document.getElementById('compatibilityContent');
-        const jsonFileName = `${cveId}-compatibility.json`;
-
-        fetch(`/api/cve/${cveId}/file/${jsonFileName}`)
-            .then(response => {
-                if (!response.ok) throw new Error('File not found');
-                return response.json();
-            })
+        fetch(`/api/cve/${cveId}/file/${cveId}-compatibility.json`)
+            .then(res => { if (!res.ok) throw new Error(); return res.json(); })
             .then(data => {
-                if (data.error) {
-                    contentDiv.innerHTML = `<div style="color: #dc3545;"><strong>Error:</strong> ${data.error}</div>`;
-                } else {
-                    const formatted = JSON.stringify(data, null, 2);
-                    contentDiv.innerHTML = `<pre class="json-viewer" style="margin: 0; font-family: 'Courier New', monospace; font-size: 0.9em; color: #333;">${escapeHtml(formatted)}</pre>`;
+                if (!data.error) {
+                    contentDiv.innerHTML = `<pre class="json-viewer" style="margin: 0; font-family: 'Courier New', monospace; font-size: 0.9em; color: #333;">${escapeHtml(JSON.stringify(data, null, 2))}</pre>`;
                 }
             })
-            .catch(error => {
-                contentDiv.innerHTML = `<div style="color: #dc3545;"><strong>Failed to load ${jsonFileName}:</strong> ${error.message}</div>`;
-            });
+            .catch(() => {});
 
-        // 2. Fetch and render combinations.json data
+        // 2. Fetch and render combinations.json
         const comboBadge = document.getElementById('combinationsBadge');
-        const comboSpan = document.getElementById('comboCount');
-        const comboFileName = `${cveId}-combinations.json`;
-
-        fetch(`/api/cve/${cveId}/file/${comboFileName}`)
-            .then(response => {
-                if (!response.ok) throw new Error('Combinations file not found');
-                return response.json();
-            })
+        fetch(`/api/cve/${cveId}/file/${cveId}-combinations.json`)
+            .then(res => { if (!res.ok) throw new Error(); return res.json(); })
             .then(data => {
                 comboBadge.style.display = 'block';
-                let countValue = data.total_combinations !== undefined ? data.total_combinations : (Object.values(data)[0] || data);
-                comboSpan.textContent = Number(countValue).toLocaleString();
+                let count = data.total_combinations !== undefined ? data.total_combinations : (Object.values(data)[0] || data);
+                document.getElementById('comboCount').textContent = Number(count).toLocaleString();
             })
-            .catch(error => console.warn(`Could not load ${comboFileName}:`, error));
+            .catch(() => {});
 
-        // 3. Fetch and render statistics.json data (Execution Time)
+        // 3. Fetch and render statistics.json (Execution Time)
         const timeBadge = document.getElementById('timeBadge');
-        const timeSpan = document.getElementById('execTime');
-        const statsFileName = `${cveId}-statistics.json`;
-
-        fetch(`/api/cve/${cveId}/file/${statsFileName}`)
-            .then(response => {
-                if (!response.ok) throw new Error('Statistics file not found');
-                return response.json();
-            })
+        fetch(`/api/cve/${cveId}/file/${cveId}-statistics.json`)
+            .then(res => { if (!res.ok) throw new Error(); return res.json(); })
             .then(data => {
-                // Check if elapsed_time_formatted exists in the JSON
                 if (data.elapsed_time_formatted) {
                     timeBadge.style.display = 'block';
-                    timeSpan.textContent = data.elapsed_time_formatted;
+                    document.getElementById('execTime').textContent = data.elapsed_time_formatted;
                 }
             })
-            .catch(error => console.warn(`Could not load ${statsFileName}:`, error));
+            .catch(() => {});
     });
 
-    // Helper function: Prevent XSS injection
     function escapeHtml(text) {
-        const map = {
-            '&': '&amp;',
-            '<': '&lt;',
-            '>': '&gt;',
-            '"': '&quot;',
-            "'": '&#039;'
-        };
+        const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
         return text.replace(/[&<>"']/g, m => map[m]);
     }
 </script>
